@@ -1,0 +1,1014 @@
+#!/usr/bin/env tsx
+/**
+ * Bulk-import 542 work orders from UGL's daily SOR Extract into monday's
+ * Active Jobs (5028084872) and Approved & Paid Jobs (5028088229) boards
+ * — the one-shot data import that completes Step 2 of the work order
+ * setup. Run AFTER Step 1's schema PR (#30) has merged and Netlify has
+ * deployed.
+ *
+ * Per-Asset workflow:
+ *   1. Group all SOR Extract rows by Asset ID (one job per asset)
+ *   2. Look up rate-card item names + descriptions per SOR code
+ *   3. Compute the asset's "aggregated" UGL Payment Status (most-advanced
+ *      across its SORs — Paid > Approved > etc., per Step 2 brief)
+ *   4. Route to Active Jobs or Approved & Paid based on that status:
+ *        Active Jobs:  Pending Construction, Pending Artefacts, In Review,
+ *                      Disputed, Overpaid, Paid - Pending RCTI, Partial Paid
+ *        Approved:     Approved, Paid, Descoped
+ *   5. Build the canonical name via buildJobName() (Step 1.6)
+ *   6. For Pending Construction only — create a bare Network Assets row
+ *      and link Primary Asset
+ *   7. Stage the create; batched-alias mutations apply ~25 per request
+ *
+ * Idempotent: pre-fetches both target boards and skips Asset IDs already
+ * present (compares against the Asset ID text column).
+ *
+ * Usage:
+ *   tsx scripts/import_work_orders.ts <path/to/extract.xlsx> [--dry-run]
+ *   npm run import-jobs      <file>
+ *   npm run import-jobs-dry  <file>
+ */
+import ExcelJS from "exceljs";
+import * as path from "path";
+import { buildJobName } from "./lib/build_job_name";
+
+// ---------- Config ----------
+const ACTIVE_JOBS_BOARD = 5028084872;
+const APPROVED_JOBS_BOARD = 5028088229;
+const NETWORK_ASSETS_BOARD = 5028087505;
+const RATE_CARD_BOARD = 5028088248;
+
+// Active Jobs columns (from src/lib/monday-ids.ts)
+const ACTIVE_COL = {
+  ASSET_TEXT: "text_mm2tmm57",
+  SAM_ADA: "text_mm2tw65k",
+  RCTI: "text_mm2tdrdk",
+  JOB_STATUS: "color_mm2tff18",
+  UGL_PAYMENT_STATUS: "color_mm32x3ga",
+  PRIMARY_ASSET: "board_relation_mm2tyedq",
+  JOB_START_DATE: "date_mm2t1bck",
+  DATE_SUBMITTED: "date_mm2tm5wk",
+  DATE_APPROVED: "date_mm2twe5z",
+  DATE_PAID: "date_mm2tz2vv",
+  QUICK_NOTE: "long_text_mm2t73fd",
+};
+
+// Approved & Paid Jobs columns (from src/lib/monday-ids.ts APPROVED_JOB_COLUMNS)
+const APPROVED_COL = {
+  ASSET_TEXT: "text_mm325kny",
+  SAM_ADA: "text_mm32z5ej",
+  RCTI: "text_mm32c4fj",
+  JOB_STATUS: "color_mm329x8a",
+  UGL_PAYMENT_STATUS: "color_mm322s90",
+  PRIMARY_ASSET: "board_relation_mm32kh12",
+  JOB_START_DATE: "date_mm32d4s9",
+  DATE_SUBMITTED: "date_mm32cc9k",
+  DATE_APPROVED: "date_mm32p2b7",
+  DATE_PAID: "date_mm32cjpd",
+  QUICK_NOTE: "long_text_mm3277sp",
+};
+
+// Network Assets columns
+const NETWORK_COL = {
+  ASSET_CLASS: "color_mm2tk5ca",
+  PROJECT_ID: "text_mm2tm60t",
+  SAM: "text_mm2tcgm",
+  ADA: "text_mm2thpn1",
+};
+
+// Rate Card columns
+const RATE_CARD_COL = {
+  SOR_CODE: "text_mm2t5h7w",
+  NAME: "name", // Rate Card row name = friendly Item Name
+};
+
+const BATCH_SIZE = 25;
+
+/**
+ * Status priority — most-advanced first. When an Asset has SORs in
+ * different statuses, the asset's aggregated status is the LOWEST index
+ * (most advanced) found among its SORs.
+ *
+ * Per the Step 2 brief: "Paid > Approved > Pending RCTI > etc."
+ */
+const STATUS_PRIORITY = [
+  "Paid", // 0 — terminal, money in
+  "Paid - Pending RCTI", // 1 — paid, RCTI not yet
+  "Partial Paid", // 2 — some money in
+  "Approved", // 3 — UGL approved, awaiting payment
+  "In Review", // 4 — UGL reviewing
+  "Pending Artefacts", // 5 — waiting on our photos
+  "Pending Construction", // 6 — work not started
+  "Overpaid", // 7 — anomaly: paid more than agreed
+  "Disputed", // 8 — anomaly: rejected
+  "Descoped", // 9 — terminal: cancelled
+];
+
+const TERMINAL_STATUSES = new Set(["Approved", "Paid", "Descoped"]);
+
+// ---------- Types ----------
+interface ExtractRow {
+  rowIndex: number;
+  projectId: string | null;
+  ada: string | null;
+  assetId: string;
+  sor: string;
+  sorDescription: string | null;
+  designQty: number | null;
+  actualQty: number | null;
+  acceptedQty: number | null;
+  consStatus: string | null;
+  sorStatus: string | null;
+  invoiceNo: string | null;
+  constructionDate: string | null; // ISO YYYY-MM-DD
+  reviewDate: string | null;
+  comments: string | null;
+}
+
+interface AssetGroup {
+  assetId: string;
+  rows: ExtractRow[];
+  /** All SOR codes for this asset, deduped, in extract order */
+  sorCodes: string[];
+  /** Item names from rate card, in same order as sorCodes (filtered to non-empty) */
+  itemNames: string[];
+  /** Aggregated UGL Payment Status — most advanced across all SORs */
+  aggregatedStatus: string;
+  /** Most recent ISO date across SORs, or null */
+  latestConstructionDate: string | null;
+  latestReviewDate: string | null;
+  /** First non-null invoice number we encounter */
+  rctiNumber: string | null;
+  /** Concatenated comments, deduped */
+  comments: string;
+  /** First non-null Project ID / SAM / ADA from rows */
+  projectId: string | null;
+  ada: string | null;
+}
+
+interface PlannedItem {
+  asset: AssetGroup;
+  /** Which board the row goes on */
+  targetBoard: typeof ACTIVE_JOBS_BOARD | typeof APPROVED_JOBS_BOARD;
+  /** "active" or "approved" — for log readability */
+  targetName: "active" | "approved";
+  /** Computed item name */
+  name: string;
+  /** Skip reason, when set the item is NOT applied */
+  skipReason: string | null;
+  /** When set, an existing Network Assets monday id we'll link via Primary Asset.
+   *  null = no Network Assets link (archive imports + non-Pending-Construction
+   *  Active Jobs rows). string = link this item id. */
+  networkAssetId: string | null;
+  /** When true, also create a new Network Assets row before the job row.
+   *  Set only for Pending Construction assets that don't already exist on
+   *  Network Assets. */
+  needsNetworkAsset: boolean;
+}
+
+// ---------- Monday client ----------
+async function monday<T>(
+  query: string,
+  variables: Record<string, unknown> = {}
+): Promise<T> {
+  const token = process.env.MONDAY_API_TOKEN;
+  if (!token) throw new Error("MONDAY_API_TOKEN env var not set");
+  const res = await fetch("https://api.monday.com/v2", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+      "API-Version": "2024-01",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`monday HTTP ${res.status} ${res.statusText}`);
+  const json = (await res.json()) as { data?: T; errors?: unknown };
+  if (json.errors) {
+    throw new Error(`monday errors: ${JSON.stringify(json.errors)}`);
+  }
+  return json.data as T;
+}
+
+// ---------- Spreadsheet parser (mirrors sync_sor_extract.ts) ----------
+function cellText(v: ExcelJS.CellValue): string | null {
+  if (v == null) return null;
+  if (typeof v === "string") return v.trim() || null;
+  if (typeof v === "number") return String(v);
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  if (typeof v === "object" && "text" in v && typeof v.text === "string") {
+    return v.text.trim() || null;
+  }
+  if (typeof v === "object" && "result" in v) {
+    return cellText(v.result as ExcelJS.CellValue);
+  }
+  return String(v).trim() || null;
+}
+function cellNumber(v: ExcelJS.CellValue): number | null {
+  if (v == null || v === "") return null;
+  if (typeof v === "number") return v;
+  if (typeof v === "string") {
+    const t = v.trim().replace(/[$,\s]/g, "");
+    if (!t) return null;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (typeof v === "object" && "result" in v) {
+    return cellNumber(v.result as ExcelJS.CellValue);
+  }
+  return null;
+}
+function cellDateIso(v: ExcelJS.CellValue): string | null {
+  if (v == null || v === "") return null;
+  if (v instanceof Date) {
+    if (Number.isNaN(v.getTime())) return null;
+    return v.toISOString().slice(0, 10);
+  }
+  if (typeof v === "string") {
+    const t = v.trim();
+    if (!t) return null;
+    const m = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (m) {
+      const [, d, mo, y] = m;
+      return `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`;
+    }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
+    return null;
+  }
+  if (typeof v === "object" && "result" in v) {
+    return cellDateIso(v.result as ExcelJS.CellValue);
+  }
+  return null;
+}
+
+async function readExtract(filePath: string): Promise<ExtractRow[]> {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(filePath);
+  const ws = wb.getWorksheet("Cons_Data");
+  if (!ws) throw new Error("Cons_Data sheet not found");
+
+  const header: Record<string, number> = {};
+  ws.getRow(1).eachCell((cell, col) => {
+    const t = cellText(cell.value);
+    if (t) header[t] = col;
+  });
+  const required = [
+    "Asset ID",
+    "SOR",
+    "SOR Description",
+    "Project ID",
+    "ADA",
+    "Design Qty",
+    "Actual Qty",
+    "accepted_qty",
+    "Cons Status",
+    "SOR Status",
+    "Invoice #",
+    "construction_date",
+    "review_date",
+    "comments",
+  ];
+  for (const name of required) {
+    if (!header[name]) throw new Error(`Missing column "${name}" in Cons_Data`);
+  }
+
+  const rows: ExtractRow[] = [];
+  for (let r = 2; r <= ws.rowCount; r++) {
+    const row = ws.getRow(r);
+    const get = (name: string) => row.getCell(header[name]).value;
+    const assetId = cellText(get("Asset ID"));
+    const sor = cellText(get("SOR"));
+    if (!assetId || !sor) continue;
+    rows.push({
+      rowIndex: r,
+      projectId: cellText(get("Project ID")),
+      ada: cellText(get("ADA")),
+      assetId,
+      sor,
+      sorDescription: cellText(get("SOR Description")),
+      designQty: cellNumber(get("Design Qty")),
+      actualQty: cellNumber(get("Actual Qty")),
+      acceptedQty: cellNumber(get("accepted_qty")),
+      consStatus: cellText(get("Cons Status")),
+      sorStatus: cellText(get("SOR Status")),
+      invoiceNo: cellText(get("Invoice #")),
+      constructionDate: cellDateIso(get("construction_date")),
+      reviewDate: cellDateIso(get("review_date")),
+      comments: cellText(get("comments")),
+    });
+  }
+  return rows;
+}
+
+// ---------- Rate Card lookup ----------
+async function fetchRateCard(): Promise<Map<string, string>> {
+  // SOR Code -> Item Name
+  const data = await monday<{
+    boards: Array<{
+      items_page: {
+        items: Array<{
+          id: string;
+          name: string;
+          column_values: Array<{ id: string; text: string | null }>;
+        }>;
+      };
+    }>;
+  }>(
+    `query ($boardId: ID!) {
+      boards(ids: [$boardId]) {
+        items_page(limit: 500) {
+          items {
+            id name
+            column_values(ids: ["${RATE_CARD_COL.SOR_CODE}"]) { id text }
+          }
+        }
+      }
+    }`,
+    { boardId: String(RATE_CARD_BOARD) }
+  );
+  const map = new Map<string, string>();
+  for (const item of data.boards?.[0]?.items_page?.items ?? []) {
+    const sorCode = item.column_values.find((c) => c.id === RATE_CARD_COL.SOR_CODE)
+      ?.text;
+    if (sorCode && item.name) {
+      map.set(sorCode.trim().toUpperCase(), item.name.trim());
+    }
+  }
+  return map;
+}
+
+// ---------- Existing Asset IDs on target boards (for idempotency) ----------
+async function fetchExistingAssetIds(
+  boardId: number,
+  assetIdColId: string
+): Promise<Set<string>> {
+  const ids = new Set<string>();
+  let cursor: string | null = null;
+  for (let pg = 1; pg <= 10; pg++) {
+    const data = await monday<{
+      boards?: Array<{ items_page: { cursor: string | null; items: Array<{ column_values: Array<{ text: string | null }> }> } }>;
+      next_items_page?: { cursor: string | null; items: Array<{ column_values: Array<{ text: string | null }> }> };
+    }>(
+      cursor
+        ? `query ($cursor: String!, $col: [String!]) {
+            next_items_page(limit: 500, cursor: $cursor) {
+              cursor items { column_values(ids: $col) { text } }
+            }
+          }`
+        : `query ($boardId: ID!, $col: [String!]) {
+            boards(ids: [$boardId]) {
+              items_page(limit: 500) {
+                cursor items { column_values(ids: $col) { text } }
+              }
+            }
+          }`,
+      cursor ? { cursor, col: [assetIdColId] } : { boardId: String(boardId), col: [assetIdColId] }
+    );
+    type Page = { cursor: string | null; items: Array<{ column_values: Array<{ text: string | null }> }> };
+    const page: Page = cursor ? data.next_items_page! : data.boards![0]!.items_page;
+    for (const item of page.items) {
+      const t = item.column_values[0]?.text;
+      if (t) ids.add(t.trim());
+    }
+    if (!page.cursor) break;
+    cursor = page.cursor;
+  }
+  return ids;
+}
+
+async function fetchNetworkAssetMap(): Promise<Map<string, string>> {
+  // Asset ID (row name) -> monday item id. Network Assets rows use the
+  // human/numeric Asset ID as the row name. 147 rows currently — one page.
+  const data = await monday<{
+    boards: Array<{
+      items_page: {
+        items: Array<{ id: string; name: string }>;
+      };
+    }>;
+  }>(
+    `query ($boardId: ID!) {
+      boards(ids: [$boardId]) {
+        items_page(limit: 500) { items { id name } }
+      }
+    }`,
+    { boardId: String(NETWORK_ASSETS_BOARD) }
+  );
+  const map = new Map<string, string>();
+  for (const item of data.boards?.[0]?.items_page?.items ?? []) {
+    if (item.name) map.set(item.name.trim(), item.id);
+  }
+  return map;
+}
+
+// ---------- Aggregation per Asset ----------
+function priorityOf(status: string | null): number {
+  if (!status) return 999;
+  const idx = STATUS_PRIORITY.indexOf(status);
+  return idx === -1 ? 999 : idx;
+}
+
+function deriveAssetClass(assetId: string): string | null {
+  // Asset names like 2CSN-21-07-DCT-652 / 2MAC-22-06-PIT-708 / 2URL-20-06-MH-...
+  // Numeric-only ids (000000003200512558) we leave class null — those are
+  // legacy infrastructure and Heath's normal import sets the class.
+  // Label names match the live Network Assets `Asset Class` column —
+  // they're "DCT (Duct)" / "PIT (Pit)" / "MH (Manhole)" verbatim, not
+  // the bare class abbreviations. The first-pass import attempted to
+  // write the bare strings and monday rejected every Network Assets
+  // create with "This status label doesn't exist".
+  const m = assetId.match(/-(DCT|PIT|MH)-/i);
+  if (m) {
+    const t = m[1].toUpperCase();
+    if (t === "DCT") return "DCT (Duct)";
+    if (t === "PIT") return "PIT (Pit)";
+    if (t === "MH") return "MH (Manhole)";
+  }
+  return null;
+}
+
+function aggregateAsset(
+  assetId: string,
+  rows: ExtractRow[],
+  rateCard: Map<string, string>
+): AssetGroup {
+  const sorCodes: string[] = [];
+  const seenSor = new Set<string>();
+  const itemNames: string[] = [];
+  const seenName = new Set<string>();
+  const commentParts: string[] = [];
+  let aggStatus = "";
+  let aggIdx = 999;
+  let latestConstr: string | null = null;
+  let latestReview: string | null = null;
+  let rctiNumber: string | null = null;
+  let projectId: string | null = null;
+  let ada: string | null = null;
+
+  for (const r of rows) {
+    if (!seenSor.has(r.sor)) {
+      seenSor.add(r.sor);
+      sorCodes.push(r.sor);
+      const name = rateCard.get(r.sor.trim().toUpperCase());
+      if (name && !seenName.has(name)) {
+        seenName.add(name);
+        itemNames.push(name);
+      }
+    }
+    const idx = priorityOf(r.sorStatus);
+    if (idx < aggIdx) {
+      aggIdx = idx;
+      aggStatus = r.sorStatus ?? "";
+    }
+    if (r.constructionDate && (!latestConstr || r.constructionDate > latestConstr)) {
+      latestConstr = r.constructionDate;
+    }
+    if (r.reviewDate && (!latestReview || r.reviewDate > latestReview)) {
+      latestReview = r.reviewDate;
+    }
+    if (!rctiNumber && r.invoiceNo) rctiNumber = r.invoiceNo;
+    if (!projectId && r.projectId) projectId = r.projectId;
+    if (!ada && r.ada) ada = r.ada;
+    if (r.comments && r.comments.trim()) {
+      const tagged = `[${r.sor}] ${r.comments.trim()}`;
+      if (!commentParts.includes(tagged)) commentParts.push(tagged);
+    }
+  }
+
+  // Empty status → fall back to Cons Status if any row has Pending Construction
+  if (!aggStatus) {
+    const consPending = rows.find((r) => r.consStatus === "Pending");
+    if (consPending) aggStatus = "Pending Construction";
+    else aggStatus = "Pending"; // ultimate fallback
+  }
+
+  return {
+    assetId,
+    rows,
+    sorCodes,
+    itemNames,
+    aggregatedStatus: aggStatus,
+    latestConstructionDate: latestConstr,
+    latestReviewDate: latestReview,
+    rctiNumber,
+    comments: commentParts.join("\n\n"),
+    projectId,
+    ada,
+  };
+}
+
+// ---------- Routing & planning ----------
+function routeAsset(asset: AssetGroup): "active" | "approved" {
+  return TERMINAL_STATUSES.has(asset.aggregatedStatus) ? "approved" : "active";
+}
+
+function planAssets(
+  groups: AssetGroup[],
+  existingActive: Set<string>,
+  existingApproved: Set<string>,
+  networkAssetMap: Map<string, string>
+): PlannedItem[] {
+  const planned: PlannedItem[] = [];
+  for (const a of groups) {
+    const target = routeAsset(a);
+    const targetBoard = target === "active" ? ACTIVE_JOBS_BOARD : APPROVED_JOBS_BOARD;
+    const existingSet = target === "active" ? existingActive : existingApproved;
+
+    const networkAssetId = networkAssetMap.get(a.assetId) ?? null;
+    const isPendingCons = a.aggregatedStatus === "Pending Construction";
+    const needsNetworkAsset = isPendingCons && !networkAssetId;
+
+    const name = buildJobName(a.itemNames, a.assetId, null);
+
+    let skipReason: string | null = null;
+    if (existingSet.has(a.assetId)) {
+      skipReason = `already on ${target} board`;
+    }
+
+    planned.push({
+      asset: a,
+      targetBoard,
+      targetName: target,
+      name,
+      skipReason,
+      networkAssetId,
+      needsNetworkAsset,
+    });
+  }
+  return planned;
+}
+
+// ---------- Apply (batched) ----------
+interface ApplyResult {
+  createdNetworkAssets: number;
+  createdActive: number;
+  createdApproved: number;
+  failed: number;
+  failures: string[];
+}
+
+async function applyPlan(
+  planned: PlannedItem[],
+  dryRun: boolean
+): Promise<ApplyResult> {
+  const result: ApplyResult = {
+    createdNetworkAssets: 0,
+    createdActive: 0,
+    createdApproved: 0,
+    failed: 0,
+    failures: [],
+  };
+  const toCreate = planned.filter((p) => !p.skipReason);
+
+  if (dryRun) {
+    result.createdNetworkAssets = toCreate.filter((p) => p.needsNetworkAsset).length;
+    result.createdActive = toCreate.filter((p) => p.targetName === "active").length;
+    result.createdApproved = toCreate.filter((p) => p.targetName === "approved").length;
+    return result;
+  }
+
+  // Phase 1 — create Network Assets rows for Pending Construction items
+  // that don't have one. Need to capture the new monday IDs so we can
+  // link Primary Asset on the Active Jobs row in Phase 2.
+  const needsNetwork = toCreate.filter((p) => p.needsNetworkAsset);
+  for (let i = 0; i < needsNetwork.length; i += BATCH_SIZE) {
+    const batch = needsNetwork.slice(i, i + BATCH_SIZE);
+    const aliases: string[] = [];
+    const variables: Record<string, unknown> = {
+      boardId: String(NETWORK_ASSETS_BOARD),
+    };
+    batch.forEach((p, j) => {
+      const colVals: Record<string, unknown> = {};
+      const cls = deriveAssetClass(p.asset.assetId);
+      if (cls) colVals[NETWORK_COL.ASSET_CLASS] = { label: cls };
+      if (p.asset.projectId) colVals[NETWORK_COL.PROJECT_ID] = p.asset.projectId;
+      if (p.asset.ada) {
+        colVals[NETWORK_COL.SAM] = p.asset.ada; // SAM mirrors ADA when no separate SAM
+        colVals[NETWORK_COL.ADA] = p.asset.ada;
+      }
+      aliases.push(
+        `n${j}: create_item(
+          board_id: $boardId,
+          item_name: $name${j},
+          column_values: $cv${j},
+          create_labels_if_missing: false
+        ) { id }`
+      );
+      variables[`name${j}`] = p.asset.assetId;
+      variables[`cv${j}`] = JSON.stringify(colVals);
+    });
+    const argsList = batch
+      .map((_, j) => `$name${j}: String!, $cv${j}: JSON!`)
+      .join(", ");
+    const query = `mutation ($boardId: ID!, ${argsList}) { ${aliases.join("\n")} }`;
+    try {
+      const data = await monday<Record<string, { id: string }>>(query, variables);
+      batch.forEach((p, j) => {
+        const newId = data[`n${j}`]?.id;
+        if (newId) {
+          p.networkAssetId = newId;
+          result.createdNetworkAssets++;
+        }
+      });
+    } catch (err) {
+      result.failed += batch.length;
+      result.failures.push(
+        `network-asset batch ${i}: ${(err instanceof Error ? err.message : String(err)).slice(0, 250)}`
+      );
+    }
+  }
+
+  // Phase 2 — create job rows on the appropriate target board.
+  // We use change_simple_column_value-style JSON for status by name and
+  // dates. Primary Asset relation only set when networkAssetId is known.
+  for (const target of ["active", "approved"] as const) {
+    const items = toCreate.filter((p) => p.targetName === target);
+    const boardId = target === "active" ? ACTIVE_JOBS_BOARD : APPROVED_JOBS_BOARD;
+    const COL = target === "active" ? ACTIVE_COL : APPROVED_COL;
+
+    for (let i = 0; i < items.length; i += BATCH_SIZE) {
+      const batch = items.slice(i, i + BATCH_SIZE);
+      const aliases: string[] = [];
+      const variables: Record<string, unknown> = { boardId: String(boardId) };
+      batch.forEach((p, j) => {
+        const a = p.asset;
+        const colVals: Record<string, unknown> = {
+          [COL.ASSET_TEXT]: a.assetId,
+          [COL.UGL_PAYMENT_STATUS]: { label: a.aggregatedStatus },
+        };
+        if (a.ada) colVals[COL.SAM_ADA] = a.ada;
+        if (a.rctiNumber) colVals[COL.RCTI] = a.rctiNumber;
+        if (a.latestConstructionDate) {
+          colVals[COL.JOB_START_DATE] = { date: a.latestConstructionDate };
+        }
+        if (a.latestReviewDate) {
+          colVals[COL.DATE_SUBMITTED] = { date: a.latestReviewDate };
+          // Approved/Paid both populate Date Approved at review_date.
+          // Date Paid only when status is Paid (and we have a date — the
+          // extract doesn't include a separate paid_date, so review_date
+          // is the closest signal).
+          if (
+            a.aggregatedStatus === "Approved" ||
+            a.aggregatedStatus === "Paid"
+          ) {
+            colVals[COL.DATE_APPROVED] = { date: a.latestReviewDate };
+          }
+          if (a.aggregatedStatus === "Paid") {
+            colVals[COL.DATE_PAID] = { date: a.latestReviewDate };
+          }
+        }
+        if (a.comments) colVals[COL.QUICK_NOTE] = a.comments;
+        if (target === "active" && p.networkAssetId) {
+          colVals[COL.PRIMARY_ASSET] = {
+            item_ids: [parseInt(p.networkAssetId, 10)],
+          };
+        }
+        aliases.push(
+          `j${j}: create_item(
+            board_id: $boardId,
+            item_name: $name${j},
+            column_values: $cv${j},
+            create_labels_if_missing: false
+          ) { id }`
+        );
+        variables[`name${j}`] = p.name;
+        variables[`cv${j}`] = JSON.stringify(colVals);
+      });
+      const argsList = batch
+        .map((_, j) => `$name${j}: String!, $cv${j}: JSON!`)
+        .join(", ");
+      const query = `mutation ($boardId: ID!, ${argsList}) { ${aliases.join("\n")} }`;
+      try {
+        await monday(query, variables);
+        if (target === "active") result.createdActive += batch.length;
+        else result.createdApproved += batch.length;
+      } catch (err) {
+        result.failed += batch.length;
+        result.failures.push(
+          `${target}-job batch ${i}: ${(err instanceof Error ? err.message : String(err)).slice(0, 250)}`
+        );
+      }
+    }
+  }
+  return result;
+}
+
+// ---------- Update-names mode ----------
+/**
+ * `--update-names` rebuilds the `name` field on every existing job row
+ * across both target boards using the current rate-card data. Used after
+ * a Rate Card bulk rename: the SOR-Line `text_mm2tkadm` cascade refreshes
+ * those text fields, but the Active Jobs / Approved & Paid item names
+ * are snapshots built once at import time and need an explicit pass.
+ *
+ * Behaviour:
+ *  - Skips items whose name starts with "TEST" (preserves the 6 keepers)
+ *  - Re-aggregates each asset from the extract, looks up current rate-
+ *    card item names, builds a new name via buildJobName(), and writes
+ *    only when the new name differs from the current one (idempotent).
+ *  - Mutations batched 25/request via GraphQL aliases.
+ */
+async function runUpdateNames(filePath: string, dryRun: boolean) {
+  const start = Date.now();
+  console.log(
+    `[update-names] reading ${path.basename(filePath)}${dryRun ? " (dry-run)" : ""}`
+  );
+  const extract = await readExtract(filePath);
+  console.log(`[update-names] parsed ${extract.length} extract rows`);
+
+  console.log(`[update-names] fetching Rate Card`);
+  const rateCard = await fetchRateCard();
+  console.log(`[update-names] loaded ${rateCard.size} rate-card entries`);
+
+  // Group + aggregate from the extract using the same logic as the import.
+  const byAsset = new Map<string, ExtractRow[]>();
+  for (const r of extract) {
+    const list = byAsset.get(r.assetId);
+    if (list) list.push(r);
+    else byAsset.set(r.assetId, [r]);
+  }
+  const groups = Array.from(byAsset.entries()).map(([id, rows]) =>
+    aggregateAsset(id, rows, rateCard)
+  );
+  // Asset ID -> canonical name we'd build today
+  const desiredByAsset = new Map<string, string>();
+  for (const g of groups) {
+    desiredByAsset.set(g.assetId, buildJobName(g.itemNames, g.assetId, null));
+  }
+
+  // Walk both boards, find items whose current name != desired name,
+  // and queue updates. Skip TEST_-prefixed items.
+  interface Update {
+    boardId: number;
+    itemId: string;
+    currentName: string;
+    newName: string;
+  }
+  const updates: Update[] = [];
+  let skippedTest = 0;
+  let unchanged = 0;
+  let noExtractMatch = 0;
+
+  for (const [boardId, assetCol] of [
+    [ACTIVE_JOBS_BOARD, ACTIVE_COL.ASSET_TEXT] as const,
+    [APPROVED_JOBS_BOARD, APPROVED_COL.ASSET_TEXT] as const,
+  ]) {
+    const data = await monday<{
+      boards: Array<{
+        items_page: {
+          items: Array<{
+            id: string;
+            name: string;
+            column_values: Array<{ id: string; text: string | null }>;
+          }>;
+        };
+      }>;
+    }>(
+      `query ($boardId: ID!, $col: [String!]) {
+        boards(ids: [$boardId]) {
+          items_page(limit: 500) {
+            items {
+              id name
+              column_values(ids: $col) { id text }
+            }
+          }
+        }
+      }`,
+      { boardId: String(boardId), col: [assetCol] }
+    );
+    const items = data.boards?.[0]?.items_page?.items ?? [];
+    console.log(
+      `[update-names] fetched ${items.length} items from board ${boardId}`
+    );
+    for (const item of items) {
+      // Preserve TEST_-prefixed keepers and the "TEST — " name format
+      // used by the 6 active keepers.
+      if (
+        item.name.startsWith("TEST_") ||
+        item.name.startsWith("TEST —") ||
+        item.name.startsWith("TEST -")
+      ) {
+        skippedTest++;
+        continue;
+      }
+      const assetIdText =
+        item.column_values.find((c) => c.id === assetCol)?.text ?? "";
+      const desired = desiredByAsset.get(assetIdText.trim());
+      if (!desired) {
+        noExtractMatch++;
+        continue;
+      }
+      if (desired === item.name) {
+        unchanged++;
+        continue;
+      }
+      updates.push({
+        boardId,
+        itemId: item.id,
+        currentName: item.name,
+        newName: desired,
+      });
+    }
+  }
+
+  console.log(
+    `\n[update-names] plan: ${updates.length} renames, ${unchanged} unchanged, ${skippedTest} TEST_-prefix preserved, ${noExtractMatch} no extract match`
+  );
+  if (updates.length > 0) {
+    console.log(`[update-names] sample (first 5):`);
+    for (const u of updates.slice(0, 5)) {
+      console.log(`  ${u.itemId}:`);
+      console.log(`    OLD: ${u.currentName.slice(0, 100)}`);
+      console.log(`    NEW: ${u.newName.slice(0, 100)}`);
+    }
+  }
+
+  let renamed = 0;
+  let failed = 0;
+  const failures: string[] = [];
+
+  if (!dryRun) {
+    for (const targetBoard of [ACTIVE_JOBS_BOARD, APPROVED_JOBS_BOARD]) {
+      const subset = updates.filter((u) => u.boardId === targetBoard);
+      for (let i = 0; i < subset.length; i += BATCH_SIZE) {
+        const batch = subset.slice(i, i + BATCH_SIZE);
+        const aliases: string[] = [];
+        const variables: Record<string, unknown> = { boardId: String(targetBoard) };
+        batch.forEach((u, j) => {
+          aliases.push(
+            `r${j}: change_simple_column_value(
+              item_id: $i${j},
+              board_id: $boardId,
+              column_id: "name",
+              value: $v${j}
+            ) { id }`
+          );
+          variables[`i${j}`] = String(u.itemId);
+          variables[`v${j}`] = u.newName;
+        });
+        const argsList = batch
+          .map((_, j) => `$i${j}: ID!, $v${j}: String!`)
+          .join(", ");
+        const query = `mutation ($boardId: ID!, ${argsList}) { ${aliases.join("\n")} }`;
+        try {
+          await monday(query, variables);
+          renamed += batch.length;
+        } catch (err) {
+          failed += batch.length;
+          failures.push(
+            `board ${targetBoard} batch ${i}: ${(err instanceof Error ? err.message : String(err)).slice(0, 250)}`
+          );
+        }
+      }
+    }
+  } else {
+    renamed = updates.length;
+  }
+
+  console.log(
+    `\n[update-names] ${dryRun ? "DRY-RUN" : "APPLIED"} in ${((Date.now() - start) / 1000).toFixed(1)}s` +
+      `\n  renamed:               ${renamed}` +
+      `\n  unchanged:             ${unchanged}` +
+      `\n  TEST_-prefix preserved:${skippedTest}` +
+      `\n  no extract match:      ${noExtractMatch}` +
+      `\n  failed:                ${failed}`
+  );
+  if (failures.length > 0) {
+    console.log(`\n[update-names] failures:`);
+    for (const f of failures) console.log(`  ${f}`);
+    if (!dryRun) process.exit(2);
+  }
+}
+
+// ---------- Main ----------
+async function main() {
+  const args = process.argv.slice(2);
+  const dryRun = args.includes("--dry-run");
+  const updateNames = args.includes("--update-names");
+  const filePath = args.find((a) => !a.startsWith("--"));
+  if (!filePath) {
+    console.error(
+      "Usage: tsx scripts/import_work_orders.ts <path/to/extract.xlsx> [--dry-run] [--update-names]"
+    );
+    process.exit(1);
+  }
+  if (updateNames) {
+    await runUpdateNames(filePath, dryRun);
+    return;
+  }
+
+  const start = Date.now();
+  console.log(
+    `[import] reading ${path.basename(filePath)}${dryRun ? " (dry-run)" : ""}`
+  );
+  const extract = await readExtract(filePath);
+  console.log(`[import] parsed ${extract.length} extract rows`);
+
+  console.log(`[import] fetching Rate Card`);
+  const rateCard = await fetchRateCard();
+  console.log(`[import] loaded ${rateCard.size} rate-card entries`);
+
+  console.log(`[import] fetching existing rows on target boards`);
+  const [existingActive, existingApproved, networkAssets] = await Promise.all([
+    fetchExistingAssetIds(ACTIVE_JOBS_BOARD, ACTIVE_COL.ASSET_TEXT),
+    fetchExistingAssetIds(APPROVED_JOBS_BOARD, APPROVED_COL.ASSET_TEXT),
+    fetchNetworkAssetMap(),
+  ]);
+  console.log(
+    `[import] existing: ${existingActive.size} active jobs, ${existingApproved.size} approved jobs, ${networkAssets.size} network assets`
+  );
+
+  // Group by Asset ID
+  const byAsset = new Map<string, ExtractRow[]>();
+  for (const r of extract) {
+    const list = byAsset.get(r.assetId);
+    if (list) list.push(r);
+    else byAsset.set(r.assetId, [r]);
+  }
+  console.log(`[import] ${byAsset.size} unique assets to process`);
+
+  const groups = Array.from(byAsset.entries()).map(([id, rows]) =>
+    aggregateAsset(id, rows, rateCard)
+  );
+
+  const planned = planAssets(groups, existingActive, existingApproved, networkAssets);
+
+  // Status breakdown summary (pre-apply)
+  const byStatus = new Map<string, { active: number; approved: number; skip: number }>();
+  for (const p of planned) {
+    const k = p.asset.aggregatedStatus;
+    const cur = byStatus.get(k) ?? { active: 0, approved: 0, skip: 0 };
+    if (p.skipReason) cur.skip++;
+    else if (p.targetName === "active") cur.active++;
+    else cur.approved++;
+    byStatus.set(k, cur);
+  }
+  console.log(`\n[import] routing breakdown by aggregated status:`);
+  console.log(
+    `  ${"STATUS".padEnd(24)} | ${"ACTIVE".padStart(7)} | ${"APPROVED".padStart(8)} | ${"SKIP".padStart(5)}`
+  );
+  for (const status of STATUS_PRIORITY) {
+    const cur = byStatus.get(status);
+    if (!cur || cur.active + cur.approved + cur.skip === 0) continue;
+    console.log(
+      `  ${status.padEnd(24)} | ${String(cur.active).padStart(7)} | ${String(cur.approved).padStart(8)} | ${String(cur.skip).padStart(5)}`
+    );
+  }
+  // Anomalies (status not in priority list)
+  for (const [k, v] of byStatus.entries()) {
+    if (!STATUS_PRIORITY.includes(k)) {
+      console.log(
+        `  ${("(?) " + k).padEnd(24)} | ${String(v.active).padStart(7)} | ${String(v.approved).padStart(8)} | ${String(v.skip).padStart(5)}`
+      );
+    }
+  }
+
+  const skipped = planned.filter((p) => p.skipReason);
+  if (skipped.length > 0) {
+    console.log(
+      `\n[import] ${skipped.length} assets already exist on target boards — skipping (idempotent):`
+    );
+    for (const p of skipped.slice(0, 10)) {
+      console.log(`  ${p.asset.assetId}: ${p.skipReason}`);
+    }
+    if (skipped.length > 10) console.log(`  ...${skipped.length - 10} more`);
+  }
+
+  const toCreate = planned.filter((p) => !p.skipReason);
+  console.log(
+    `\n[import] plan: ${toCreate.length} jobs to create + ${
+      toCreate.filter((p) => p.needsNetworkAsset).length
+    } network-asset rows to create`
+  );
+
+  if (toCreate.length > 0) {
+    console.log(`\n[import] sample plan (first 5):`);
+    for (const p of toCreate.slice(0, 5)) {
+      console.log(
+        `  → ${p.targetName.padEnd(8)} | ${p.asset.aggregatedStatus.padEnd(20)} | ${p.name.slice(0, 80)}${p.needsNetworkAsset ? " [+net asset]" : ""}`
+      );
+    }
+  }
+
+  const result = await applyPlan(planned, dryRun);
+
+  const elapsedSec = ((Date.now() - start) / 1000).toFixed(1);
+  console.log(
+    `\n[import] ${dryRun ? "DRY-RUN" : "APPLIED"} in ${elapsedSec}s` +
+      `\n  unique assets:           ${groups.length}` +
+      `\n  network assets created:  ${result.createdNetworkAssets}` +
+      `\n  created on Active Jobs:  ${result.createdActive}` +
+      `\n  created on Approved:     ${result.createdApproved}` +
+      `\n  skipped (already exist): ${skipped.length}` +
+      `\n  failed:                  ${result.failed}`
+  );
+  if (result.failures.length > 0) {
+    console.log(`\n[import] failures:`);
+    for (const f of result.failures) console.log(`  ${f}`);
+    if (!dryRun) process.exit(2);
+  }
+}
+
+main().catch((err) => {
+  console.error("[import] FATAL:", err);
+  process.exit(1);
+});
