@@ -15,13 +15,9 @@
   # 10s, paid plans go higher.
   external_node_modules = []
 
-# Single-page app routing: /api/sync routes to the sync function,
-# everything else falls through to index.html.
-[[redirects]]
-  from = "/api/sync"
-  to = "/.netlify/functions/sync"
-  status = 200
-
+# /api/sync is registered by the function itself via the v2 config
+# (`export const config = { path: "/api/sync" }`). Everything else falls
+# through to index.html (single-page).
 [[redirects]]
   from = "/*"
   to = "/index.html"

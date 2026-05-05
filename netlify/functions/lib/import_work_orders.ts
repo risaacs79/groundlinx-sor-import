@@ -29,8 +29,7 @@
  *   npm run import-jobs-dry  <file>
  */
 import ExcelJS from "exceljs";
-import * as path from "path";
-import { buildJobName } from "./lib/build_job_name";
+import { buildJobName } from "./build_job_name";
 
 // ---------- Config ----------
 const ACTIVE_JOBS_BOARD = 5028084872;
@@ -241,9 +240,20 @@ function cellDateIso(v: ExcelJS.CellValue): string | null {
   return null;
 }
 
-async function readExtract(filePath: string): Promise<ExtractRow[]> {
+async function readExtract(source: string | Buffer): Promise<ExtractRow[]> {
   const wb = new ExcelJS.Workbook();
-  await wb.xlsx.readFile(filePath);
+  if (typeof source === "string") {
+    await wb.xlsx.readFile(source);
+  } else {
+    // ExcelJS's typings reject the generic Node Buffer<ArrayBufferLike>
+    // shape new @types/node ships — copy into a fresh ArrayBuffer so the
+    // call type-checks under strict mode without a runtime cast.
+    const ab = source.buffer.slice(
+      source.byteOffset,
+      source.byteOffset + source.byteLength
+    ) as ArrayBuffer;
+    await wb.xlsx.load(ab);
+  }
   const ws = wb.getWorksheet("Cons_Data");
   if (!ws) throw new Error("Cons_Data sheet not found");
 
@@ -692,323 +702,74 @@ async function applyPlan(
   return result;
 }
 
-// ---------- Update-names mode ----------
-/**
- * `--update-names` rebuilds the `name` field on every existing job row
- * across both target boards using the current rate-card data. Used after
- * a Rate Card bulk rename: the SOR-Line `text_mm2tkadm` cascade refreshes
- * those text fields, but the Active Jobs / Approved & Paid item names
- * are snapshots built once at import time and need an explicit pass.
- *
- * Behaviour:
- *  - Skips items whose name starts with "TEST" (preserves the 6 keepers)
- *  - Re-aggregates each asset from the extract, looks up current rate-
- *    card item names, builds a new name via buildJobName(), and writes
- *    only when the new name differs from the current one (idempotent).
- *  - Mutations batched 25/request via GraphQL aliases.
- */
-async function runUpdateNames(filePath: string, dryRun: boolean) {
-  const start = Date.now();
-  console.log(
-    `[update-names] reading ${path.basename(filePath)}${dryRun ? " (dry-run)" : ""}`
-  );
-  const extract = await readExtract(filePath);
-  console.log(`[update-names] parsed ${extract.length} extract rows`);
-
-  console.log(`[update-names] fetching Rate Card`);
-  const rateCard = await fetchRateCard();
-  console.log(`[update-names] loaded ${rateCard.size} rate-card entries`);
-
-  // Group + aggregate from the extract using the same logic as the import.
-  const byAsset = new Map<string, ExtractRow[]>();
-  for (const r of extract) {
-    const list = byAsset.get(r.assetId);
-    if (list) list.push(r);
-    else byAsset.set(r.assetId, [r]);
-  }
-  const groups = Array.from(byAsset.entries()).map(([id, rows]) =>
-    aggregateAsset(id, rows, rateCard)
-  );
-  // Asset ID -> canonical name we'd build today
-  const desiredByAsset = new Map<string, string>();
-  for (const g of groups) {
-    desiredByAsset.set(g.assetId, buildJobName(g.itemNames, g.assetId, null));
-  }
-
-  // Walk both boards, find items whose current name != desired name,
-  // and queue updates. Skip TEST_-prefixed items.
-  interface Update {
-    boardId: number;
-    itemId: string;
-    currentName: string;
-    newName: string;
-  }
-  const updates: Update[] = [];
-  let skippedTest = 0;
-  let unchanged = 0;
-  let noExtractMatch = 0;
-
-  for (const [boardId, assetCol] of [
-    [ACTIVE_JOBS_BOARD, ACTIVE_COL.ASSET_TEXT] as const,
-    [APPROVED_JOBS_BOARD, APPROVED_COL.ASSET_TEXT] as const,
-  ]) {
-    const data = await monday<{
-      boards: Array<{
-        items_page: {
-          items: Array<{
-            id: string;
-            name: string;
-            column_values: Array<{ id: string; text: string | null }>;
-          }>;
-        };
-      }>;
-    }>(
-      `query ($boardId: ID!, $col: [String!]) {
-        boards(ids: [$boardId]) {
-          items_page(limit: 500) {
-            items {
-              id name
-              column_values(ids: $col) { id text }
-            }
-          }
-        }
-      }`,
-      { boardId: String(boardId), col: [assetCol] }
-    );
-    const items = data.boards?.[0]?.items_page?.items ?? [];
-    console.log(
-      `[update-names] fetched ${items.length} items from board ${boardId}`
-    );
-    for (const item of items) {
-      // Preserve TEST_-prefixed keepers and the "TEST — " name format
-      // used by the 6 active keepers.
-      if (
-        item.name.startsWith("TEST_") ||
-        item.name.startsWith("TEST —") ||
-        item.name.startsWith("TEST -")
-      ) {
-        skippedTest++;
-        continue;
-      }
-      const assetIdText =
-        item.column_values.find((c) => c.id === assetCol)?.text ?? "";
-      const desired = desiredByAsset.get(assetIdText.trim());
-      if (!desired) {
-        noExtractMatch++;
-        continue;
-      }
-      if (desired === item.name) {
-        unchanged++;
-        continue;
-      }
-      updates.push({
-        boardId,
-        itemId: item.id,
-        currentName: item.name,
-        newName: desired,
-      });
-    }
-  }
-
-  console.log(
-    `\n[update-names] plan: ${updates.length} renames, ${unchanged} unchanged, ${skippedTest} TEST_-prefix preserved, ${noExtractMatch} no extract match`
-  );
-  if (updates.length > 0) {
-    console.log(`[update-names] sample (first 5):`);
-    for (const u of updates.slice(0, 5)) {
-      console.log(`  ${u.itemId}:`);
-      console.log(`    OLD: ${u.currentName.slice(0, 100)}`);
-      console.log(`    NEW: ${u.newName.slice(0, 100)}`);
-    }
-  }
-
-  let renamed = 0;
-  let failed = 0;
-  const failures: string[] = [];
-
-  if (!dryRun) {
-    for (const targetBoard of [ACTIVE_JOBS_BOARD, APPROVED_JOBS_BOARD]) {
-      const subset = updates.filter((u) => u.boardId === targetBoard);
-      for (let i = 0; i < subset.length; i += BATCH_SIZE) {
-        const batch = subset.slice(i, i + BATCH_SIZE);
-        const aliases: string[] = [];
-        const variables: Record<string, unknown> = { boardId: String(targetBoard) };
-        batch.forEach((u, j) => {
-          aliases.push(
-            `r${j}: change_simple_column_value(
-              item_id: $i${j},
-              board_id: $boardId,
-              column_id: "name",
-              value: $v${j}
-            ) { id }`
-          );
-          variables[`i${j}`] = String(u.itemId);
-          variables[`v${j}`] = u.newName;
-        });
-        const argsList = batch
-          .map((_, j) => `$i${j}: ID!, $v${j}: String!`)
-          .join(", ");
-        const query = `mutation ($boardId: ID!, ${argsList}) { ${aliases.join("\n")} }`;
-        try {
-          await monday(query, variables);
-          renamed += batch.length;
-        } catch (err) {
-          failed += batch.length;
-          failures.push(
-            `board ${targetBoard} batch ${i}: ${(err instanceof Error ? err.message : String(err)).slice(0, 250)}`
-          );
-        }
-      }
-    }
-  } else {
-    renamed = updates.length;
-  }
-
-  console.log(
-    `\n[update-names] ${dryRun ? "DRY-RUN" : "APPLIED"} in ${((Date.now() - start) / 1000).toFixed(1)}s` +
-      `\n  renamed:               ${renamed}` +
-      `\n  unchanged:             ${unchanged}` +
-      `\n  TEST_-prefix preserved:${skippedTest}` +
-      `\n  no extract match:      ${noExtractMatch}` +
-      `\n  failed:                ${failed}`
-  );
-  if (failures.length > 0) {
-    console.log(`\n[update-names] failures:`);
-    for (const f of failures) console.log(`  ${f}`);
-    if (!dryRun) process.exit(2);
-  }
+// ---------- Library entry point ----------
+export interface ImportResult {
+  uniqueAssets: number;
+  networkAssetsCreated: number;
+  createdActive: number;
+  createdApproved: number;
+  skipped: number;
+  failed: number;
+  failures: string[];
+  /** Status -> { active, approved, skip } breakdown for the response card */
+  byStatus: Record<string, { active: number; approved: number; skip: number }>;
+  elapsedMs: number;
 }
 
-// ---------- Main ----------
-async function main() {
-  const args = process.argv.slice(2);
-  const dryRun = args.includes("--dry-run");
-  const updateNames = args.includes("--update-names");
-  const filePath = args.find((a) => !a.startsWith("--"));
-  if (!filePath) {
-    console.error(
-      "Usage: tsx scripts/import_work_orders.ts <path/to/extract.xlsx> [--dry-run] [--update-names]"
-    );
-    process.exit(1);
-  }
-  if (updateNames) {
-    await runUpdateNames(filePath, dryRun);
-    return;
-  }
-
+/**
+ * Import a SOR Extract `.xlsx` (loaded into memory as a Buffer) onto
+ * the Active Jobs / Approved & Paid Jobs boards plus Network Assets.
+ * Returns a structured summary the serverless handler serialises to
+ * JSON for the browser. No console output.
+ */
+export async function runImportWorkOrders(buffer: Buffer): Promise<ImportResult> {
   const start = Date.now();
-  console.log(
-    `[import] reading ${path.basename(filePath)}${dryRun ? " (dry-run)" : ""}`
-  );
-  const extract = await readExtract(filePath);
-  console.log(`[import] parsed ${extract.length} extract rows`);
-
-  console.log(`[import] fetching Rate Card`);
+  const extract = await readExtract(buffer);
   const rateCard = await fetchRateCard();
-  console.log(`[import] loaded ${rateCard.size} rate-card entries`);
-
-  console.log(`[import] fetching existing rows on target boards`);
   const [existingActive, existingApproved, networkAssets] = await Promise.all([
     fetchExistingAssetIds(ACTIVE_JOBS_BOARD, ACTIVE_COL.ASSET_TEXT),
     fetchExistingAssetIds(APPROVED_JOBS_BOARD, APPROVED_COL.ASSET_TEXT),
     fetchNetworkAssetMap(),
   ]);
-  console.log(
-    `[import] existing: ${existingActive.size} active jobs, ${existingApproved.size} approved jobs, ${networkAssets.size} network assets`
-  );
 
-  // Group by Asset ID
   const byAsset = new Map<string, ExtractRow[]>();
   for (const r of extract) {
     const list = byAsset.get(r.assetId);
     if (list) list.push(r);
     else byAsset.set(r.assetId, [r]);
   }
-  console.log(`[import] ${byAsset.size} unique assets to process`);
-
   const groups = Array.from(byAsset.entries()).map(([id, rows]) =>
     aggregateAsset(id, rows, rateCard)
   );
+  const planned = planAssets(
+    groups,
+    existingActive,
+    existingApproved,
+    networkAssets
+  );
 
-  const planned = planAssets(groups, existingActive, existingApproved, networkAssets);
-
-  // Status breakdown summary (pre-apply)
-  const byStatus = new Map<string, { active: number; approved: number; skip: number }>();
+  const byStatus: Record<string, { active: number; approved: number; skip: number }> = {};
   for (const p of planned) {
     const k = p.asset.aggregatedStatus;
-    const cur = byStatus.get(k) ?? { active: 0, approved: 0, skip: 0 };
+    const cur = byStatus[k] ?? { active: 0, approved: 0, skip: 0 };
     if (p.skipReason) cur.skip++;
     else if (p.targetName === "active") cur.active++;
     else cur.approved++;
-    byStatus.set(k, cur);
-  }
-  console.log(`\n[import] routing breakdown by aggregated status:`);
-  console.log(
-    `  ${"STATUS".padEnd(24)} | ${"ACTIVE".padStart(7)} | ${"APPROVED".padStart(8)} | ${"SKIP".padStart(5)}`
-  );
-  for (const status of STATUS_PRIORITY) {
-    const cur = byStatus.get(status);
-    if (!cur || cur.active + cur.approved + cur.skip === 0) continue;
-    console.log(
-      `  ${status.padEnd(24)} | ${String(cur.active).padStart(7)} | ${String(cur.approved).padStart(8)} | ${String(cur.skip).padStart(5)}`
-    );
-  }
-  // Anomalies (status not in priority list)
-  for (const [k, v] of byStatus.entries()) {
-    if (!STATUS_PRIORITY.includes(k)) {
-      console.log(
-        `  ${("(?) " + k).padEnd(24)} | ${String(v.active).padStart(7)} | ${String(v.approved).padStart(8)} | ${String(v.skip).padStart(5)}`
-      );
-    }
+    byStatus[k] = cur;
   }
 
   const skipped = planned.filter((p) => p.skipReason);
-  if (skipped.length > 0) {
-    console.log(
-      `\n[import] ${skipped.length} assets already exist on target boards — skipping (idempotent):`
-    );
-    for (const p of skipped.slice(0, 10)) {
-      console.log(`  ${p.asset.assetId}: ${p.skipReason}`);
-    }
-    if (skipped.length > 10) console.log(`  ...${skipped.length - 10} more`);
-  }
+  const result = await applyPlan(planned, false);
 
-  const toCreate = planned.filter((p) => !p.skipReason);
-  console.log(
-    `\n[import] plan: ${toCreate.length} jobs to create + ${
-      toCreate.filter((p) => p.needsNetworkAsset).length
-    } network-asset rows to create`
-  );
-
-  if (toCreate.length > 0) {
-    console.log(`\n[import] sample plan (first 5):`);
-    for (const p of toCreate.slice(0, 5)) {
-      console.log(
-        `  → ${p.targetName.padEnd(8)} | ${p.asset.aggregatedStatus.padEnd(20)} | ${p.name.slice(0, 80)}${p.needsNetworkAsset ? " [+net asset]" : ""}`
-      );
-    }
-  }
-
-  const result = await applyPlan(planned, dryRun);
-
-  const elapsedSec = ((Date.now() - start) / 1000).toFixed(1);
-  console.log(
-    `\n[import] ${dryRun ? "DRY-RUN" : "APPLIED"} in ${elapsedSec}s` +
-      `\n  unique assets:           ${groups.length}` +
-      `\n  network assets created:  ${result.createdNetworkAssets}` +
-      `\n  created on Active Jobs:  ${result.createdActive}` +
-      `\n  created on Approved:     ${result.createdApproved}` +
-      `\n  skipped (already exist): ${skipped.length}` +
-      `\n  failed:                  ${result.failed}`
-  );
-  if (result.failures.length > 0) {
-    console.log(`\n[import] failures:`);
-    for (const f of result.failures) console.log(`  ${f}`);
-    if (!dryRun) process.exit(2);
-  }
+  return {
+    uniqueAssets: groups.length,
+    networkAssetsCreated: result.createdNetworkAssets,
+    createdActive: result.createdActive,
+    createdApproved: result.createdApproved,
+    skipped: skipped.length,
+    failed: result.failed,
+    failures: result.failures,
+    byStatus,
+    elapsedMs: Date.now() - start,
+  };
 }
-
-main().catch((err) => {
-  console.error("[import] FATAL:", err);
-  process.exit(1);
-});
