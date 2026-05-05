@@ -4,42 +4,314 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Groundlinx SOR Sync</title>
-    <!--
-      Sub-step 1 placeholder — real UI lands in sub-step 3:
-      drag-drop area, password field, progress feed, summary card.
-      This shell is here so the Netlify deploy succeeds and the function
-      route is reachable end-to-end before sub-step 3.
-    -->
-    <style>
-      body {
-        margin: 0;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        background: #0a0a0a;
-        color: #e5e5e5;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        min-height: 100vh;
-      }
-      .placeholder {
-        text-align: center;
-        padding: 2rem;
-        max-width: 32rem;
-      }
-      h1 {
-        font-size: 1.5rem;
-        margin-bottom: 0.5rem;
-      }
-      p {
-        color: #a3a3a3;
-        font-size: 0.9rem;
-      }
-    </style>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="icon" href="data:," />
   </head>
-  <body>
-    <div class="placeholder">
-      <h1>Groundlinx SOR Sync</h1>
-      <p>Setup in progress. Upload UI lands in sub-step 3.</p>
-    </div>
+  <body class="min-h-screen bg-zinc-950 text-zinc-100 antialiased">
+    <main class="mx-auto max-w-2xl px-4 py-10">
+      <header class="mb-8">
+        <h1 class="text-2xl font-bold tracking-tight">Groundlinx SOR Sync</h1>
+        <p class="mt-1 text-sm text-zinc-400">
+          Drop today&rsquo;s UGL SOR Extract <code>.xlsx</code> below.
+          The script syncs status / RCTI / dates onto SOR Lines and
+          imports any new work orders into Active Jobs &amp; Approved boards.
+        </p>
+      </header>
+
+      <!-- Password field -->
+      <section class="mb-5">
+        <label class="block text-xs font-medium uppercase tracking-wide text-zinc-400 mb-1.5"
+               for="password-input">
+          Upload password
+        </label>
+        <input
+          id="password-input"
+          type="password"
+          autocomplete="current-password"
+          spellcheck="false"
+          class="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-zinc-600 focus:outline-none focus:ring-2 focus:ring-zinc-600/30"
+          placeholder="paste the shared password" />
+        <p class="mt-1 text-xs text-zinc-500">
+          Stored in your browser only. Never sent anywhere except the
+          server-side check.
+        </p>
+      </section>
+
+      <!-- Drag-drop zone -->
+      <section class="mb-5">
+        <div
+          id="dropzone"
+          class="relative flex flex-col items-center justify-center rounded-xl border-2 border-dashed border-zinc-700 bg-zinc-900/50 px-6 py-10 text-center transition hover:border-zinc-500 hover:bg-zinc-900">
+          <input
+            id="file-input"
+            type="file"
+            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            class="absolute inset-0 cursor-pointer opacity-0" />
+          <svg class="mb-2 h-8 w-8 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+          </svg>
+          <p id="dropzone-text" class="text-sm font-medium text-zinc-300">
+            Drop <code>.xlsx</code> here or click to choose
+          </p>
+          <p id="dropzone-hint" class="mt-1 text-xs text-zinc-500">
+            Cons_Data sheet only
+          </p>
+        </div>
+      </section>
+
+      <!-- Sync button -->
+      <button
+        id="sync-button"
+        disabled
+        class="mb-6 w-full rounded-lg bg-emerald-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-emerald-500 active:scale-[0.99] disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500">
+        Sync to Monday
+      </button>
+
+      <!-- Error / status banner -->
+      <div id="banner" class="mb-6 hidden rounded-lg border px-4 py-3 text-sm"></div>
+
+      <!-- Progress feed -->
+      <section id="progress-section" class="mb-6 hidden">
+        <h2 class="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-400">
+          Progress
+        </h2>
+        <ul id="progress-list" class="space-y-1.5 text-sm text-zinc-300"></ul>
+      </section>
+
+      <!-- Summary card -->
+      <section id="summary-section" class="hidden">
+        <h2 class="mb-3 text-xs font-medium uppercase tracking-wide text-zinc-400">
+          Result
+        </h2>
+        <div id="summary-card" class="rounded-xl border border-emerald-700/40 bg-emerald-950/30 p-5">
+        </div>
+      </section>
+
+      <footer class="mt-10 text-xs text-zinc-600">
+        <p>Server runs <code>sync_sor</code> &rarr; <code>import_work_orders</code> in sequence. Idempotent — re-running the same file is safe.</p>
+      </footer>
+    </main>
+
+    <script>
+      // ---- DOM refs ----
+      const passwordInput = document.getElementById("password-input");
+      const dropzone = document.getElementById("dropzone");
+      const dropzoneText = document.getElementById("dropzone-text");
+      const dropzoneHint = document.getElementById("dropzone-hint");
+      const fileInput = document.getElementById("file-input");
+      const syncButton = document.getElementById("sync-button");
+      const banner = document.getElementById("banner");
+      const progressSection = document.getElementById("progress-section");
+      const progressList = document.getElementById("progress-list");
+      const summarySection = document.getElementById("summary-section");
+      const summaryCard = document.getElementById("summary-card");
+
+      let selectedFile = null;
+      let busy = false;
+
+      // ---- Password persistence ----
+      const savedPw = localStorage.getItem("sorSyncPassword");
+      if (savedPw) passwordInput.value = savedPw;
+      passwordInput.addEventListener("input", () => {
+        localStorage.setItem("sorSyncPassword", passwordInput.value);
+        updateButton();
+      });
+
+      // ---- Drag-drop wiring ----
+      dropzone.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        dropzone.classList.add("border-emerald-500", "bg-emerald-950/20");
+      });
+      ["dragleave", "drop"].forEach((evt) =>
+        dropzone.addEventListener(evt, () => {
+          dropzone.classList.remove("border-emerald-500", "bg-emerald-950/20");
+        })
+      );
+      dropzone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        const file = e.dataTransfer?.files?.[0];
+        if (file) handleFile(file);
+      });
+      fileInput.addEventListener("change", (e) => {
+        const file = e.target.files?.[0];
+        if (file) handleFile(file);
+      });
+
+      function handleFile(file) {
+        if (!file.name.toLowerCase().endsWith(".xlsx")) {
+          showBanner("error", "Need a .xlsx file (got " + file.name + ")");
+          return;
+        }
+        clearBanner();
+        selectedFile = file;
+        dropzoneText.textContent = file.name;
+        dropzoneHint.textContent = (file.size / 1024).toFixed(0) + " KB — ready";
+        updateButton();
+      }
+
+      function updateButton() {
+        const ready = !!selectedFile && passwordInput.value.length > 0 && !busy;
+        syncButton.disabled = !ready;
+      }
+      updateButton();
+
+      // ---- Submit ----
+      syncButton.addEventListener("click", async () => {
+        if (busy || !selectedFile || !passwordInput.value) return;
+        busy = true;
+        updateButton();
+        clearBanner();
+        summarySection.classList.add("hidden");
+        progressSection.classList.remove("hidden");
+        progressList.innerHTML = "";
+
+        const startedAt = Date.now();
+        addProgress("Reading file…");
+        addProgress(`File: <code>${selectedFile.name}</code> (${(selectedFile.size / 1024).toFixed(0)} KB)`);
+        addProgress("Posting to /api/sync…");
+        addProgress("Server is running sync_sor and import_work_orders. This can take 2–3 minutes on a first run.", "muted");
+
+        const formData = new FormData();
+        formData.append("file", selectedFile);
+
+        let response;
+        try {
+          response = await fetch("/api/sync", {
+            method: "POST",
+            headers: { Authorization: passwordInput.value },
+            body: formData,
+          });
+        } catch (err) {
+          showBanner("error", "Network error: " + (err && err.message ? err.message : err));
+          finalize();
+          return;
+        }
+
+        let body;
+        try {
+          body = await response.json();
+        } catch (err) {
+          showBanner("error", "Server returned non-JSON response (status " + response.status + ").");
+          finalize();
+          return;
+        }
+
+        if (response.status === 401) {
+          showBanner("error", "Wrong password. Check the value in your password manager.");
+          finalize();
+          return;
+        }
+        if (response.status === 429) {
+          showBanner("error", body.error || "Rate limit hit — try again later.");
+          finalize();
+          return;
+        }
+        if (response.status === 400) {
+          showBanner("error", body.error || "The file isn't a valid SOR Extract.");
+          finalize();
+          return;
+        }
+        if (response.status === 500) {
+          showBanner("error", "Pipeline error: " + (body.error || "unknown"));
+          if (body.stage) addProgress(body.stage, "muted");
+          finalize();
+          return;
+        }
+        if (!response.ok) {
+          showBanner("error", "Unexpected status " + response.status);
+          finalize();
+          return;
+        }
+
+        // 200 OK
+        const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
+        addProgress(`Done in ${elapsedSec}s.`, "ok");
+        renderSummary(body);
+        finalize();
+      });
+
+      function finalize() {
+        busy = false;
+        updateButton();
+      }
+
+      function addProgress(html, kind) {
+        const li = document.createElement("li");
+        const dot = kind === "ok" ? "✅" : kind === "muted" ? "·" : "→";
+        li.innerHTML = `<span class="mr-2 ${kind === "muted" ? "text-zinc-500" : ""}">${dot}</span>${html}`;
+        if (kind === "muted") li.classList.add("text-zinc-500");
+        progressList.appendChild(li);
+      }
+
+      function showBanner(kind, message) {
+        banner.classList.remove("hidden");
+        banner.classList.remove("border-red-700", "bg-red-950/40", "text-red-200", "border-emerald-700", "bg-emerald-950/40", "text-emerald-200");
+        if (kind === "error") {
+          banner.classList.add("border-red-700", "bg-red-950/40", "text-red-200");
+        } else {
+          banner.classList.add("border-emerald-700", "bg-emerald-950/40", "text-emerald-200");
+        }
+        banner.textContent = message;
+      }
+      function clearBanner() {
+        banner.classList.add("hidden");
+        banner.textContent = "";
+      }
+
+      function renderSummary(body) {
+        const s = body.syncResults || {};
+        const i = body.importResults || {};
+        const seconds = ((body.totalRuntimeMs || 0) / 1000).toFixed(1);
+        summaryCard.innerHTML = `
+          <div class="mb-4 flex items-baseline justify-between gap-2">
+            <h3 class="text-base font-semibold text-emerald-200">${escapeHtml(body.filename || "extract.xlsx")}</h3>
+            <span class="text-xs text-emerald-300/80">${seconds}s · ${body.fileSizeKB || "?"} KB</span>
+          </div>
+          <dl class="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+            <dt class="text-zinc-400">SOR Lines updated</dt>
+            <dd class="text-right font-mono text-zinc-100">${s.updated ?? "?"}</dd>
+            <dt class="text-zinc-400">unchanged</dt>
+            <dd class="text-right font-mono text-zinc-400">${s.unchanged ?? "?"}</dd>
+            <dt class="text-zinc-400">unmatched</dt>
+            <dd class="text-right font-mono text-zinc-400">${s.unmatched ?? "?"}</dd>
+            <dt class="text-zinc-400 mt-2">Created on Active Jobs</dt>
+            <dd class="text-right font-mono text-zinc-100 mt-2">${i.createdActive ?? "?"}</dd>
+            <dt class="text-zinc-400">Created on Approved &amp; Paid</dt>
+            <dd class="text-right font-mono text-zinc-100">${i.createdApproved ?? "?"}</dd>
+            <dt class="text-zinc-400">Network Assets created</dt>
+            <dd class="text-right font-mono text-zinc-100">${i.networkAssetsCreated ?? "?"}</dd>
+            <dt class="text-zinc-400">skipped (already imported)</dt>
+            <dd class="text-right font-mono text-zinc-400">${i.skipped ?? "?"}</dd>
+          </dl>
+          ${(s.newPaid?.length || s.newFieldComplete?.length) ? `
+            <div class="mt-4 grid grid-cols-2 gap-3 text-xs">
+              ${s.newFieldComplete?.length ? `<div><div class="text-zinc-400">New "Field Complete"</div><div class="font-mono text-emerald-200">+${s.newFieldComplete.length}</div></div>` : ""}
+              ${s.newPaid?.length ? `<div><div class="text-zinc-400">New "Paid"</div><div class="font-mono text-emerald-200">+${s.newPaid.length}</div></div>` : ""}
+            </div>
+          ` : ""}
+          <div class="mt-5 flex gap-3 text-sm">
+            <a href="https://mv-civil-company.monday.com/boards/5028084872" target="_blank" rel="noopener"
+               class="rounded-md border border-emerald-700 bg-emerald-900/40 px-3 py-1.5 text-emerald-200 hover:bg-emerald-900/60">
+              Active Jobs &rarr;
+            </a>
+            <a href="https://mv-civil-company.monday.com/boards/5028088229" target="_blank" rel="noopener"
+               class="rounded-md border border-emerald-700 bg-emerald-900/40 px-3 py-1.5 text-emerald-200 hover:bg-emerald-900/60">
+              Approved &amp; Paid &rarr;
+            </a>
+          </div>
+        `;
+        summarySection.classList.remove("hidden");
+      }
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, (c) => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[c]);
+      }
+    </script>
   </body>
 </html>

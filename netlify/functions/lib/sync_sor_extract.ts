@@ -1,24 +1,22 @@
-#!/usr/bin/env tsx
 /**
  * Sync UGL's daily SOR Extract spreadsheet into the SOR Lines board.
  *
- * Replaces the row-by-row VA workflow. Reads the `Cons_Data` sheet,
- * matches each row to an existing SOR Lines item by (Asset ID, SOR
- * code), diffs the values, and only writes the columns that actually
- * changed. Idempotent — safe to re-run the same file.
+ * Library export `runSyncSor(buffer)` is consumed by the serverless
+ * handler at netlify/functions/sync.ts. The original CLI flow lives on
+ * the main field-app repo at scripts/sync_sor_extract.ts (PR #27);
+ * this version is the buffer-driven library variant.
  *
- * Usage:
- *   tsx scripts/sync_sor_extract.ts <path/to/extract.xlsx> [--dry-run]
+ * Reads the `Cons_Data` sheet, matches each row to an existing SOR
+ * Lines item by (Asset ID, SOR code), diffs the values, and only
+ * writes the columns that actually changed. Idempotent — safe to
+ * re-run the same file. Never CREATES new SOR Lines rows — Heath /
+ * UGL imports own row creation. Spreadsheet rows with no monday match
+ * are logged and skipped. Empty cells in the spreadsheet are NEVER
+ * written over a populated monday value.
  *
  * Required env: MONDAY_API_TOKEN
- *
- * The script never CREATES new SOR Lines rows — Heath / UGL imports own
- * row creation. Spreadsheet rows with no monday match are logged and
- * skipped. Empty cells in the spreadsheet are NEVER written over a
- * populated monday value.
  */
 import ExcelJS from "exceljs";
-import * as path from "path";
 
 // ---------- Config (mirrors src/lib/monday-ids.ts SOR_COLUMNS) ----------
 const SOR_BOARD_ID = 5028087610;
@@ -182,9 +180,19 @@ function cellDateIso(v: ExcelJS.CellValue): string | null {
   return null;
 }
 
-async function readExtract(filePath: string): Promise<ExtractRow[]> {
+async function readExtract(source: string | Buffer): Promise<ExtractRow[]> {
   const wb = new ExcelJS.Workbook();
-  await wb.xlsx.readFile(filePath);
+  if (typeof source === "string") {
+    await wb.xlsx.readFile(source);
+  } else {
+    // See note in import_work_orders.ts — convert Node Buffer to a
+    // fresh ArrayBuffer so ExcelJS.load type-checks under strict mode.
+    const ab = source.buffer.slice(
+      source.byteOffset,
+      source.byteOffset + source.byteLength
+    ) as ArrayBuffer;
+    await wb.xlsx.load(ab);
+  }
   const ws = wb.getWorksheet("Cons_Data");
   if (!ws) throw new Error("Cons_Data sheet not found in workbook");
 
@@ -320,7 +328,7 @@ function indexMondayRows(
 }
 
 function joinKey(assetId: string, sor: string): string {
-  return `${assetId.trim()} ${sor.trim().toUpperCase()}`;
+  return `${assetId.trim()}|||${sor.trim().toUpperCase()}`;
 }
 
 // ---------- Diff a single row ----------
@@ -473,35 +481,34 @@ async function applyDiffs(
   return { updated, failed, failures };
 }
 
-// ---------- Main ----------
-async function main() {
-  const args = process.argv.slice(2);
-  const dryRun = args.includes("--dry-run");
-  const filePath = args.find((a) => !a.startsWith("--"));
+// ---------- Library entry point ----------
+export interface SyncResult {
+  rowsProcessed: number;
+  toUpdate: number;
+  updated: number;
+  unchanged: number;
+  unmatched: number;
+  failed: number;
+  failures: string[];
+  /** "<assetId> / <sor>" keys whose Cons Status flipped to "Field Complete" on this run */
+  newFieldComplete: string[];
+  /** "<assetId> / <sor>" keys whose SOR Status flipped to "Paid" on this run */
+  newPaid: string[];
+  elapsedMs: number;
+}
 
-  if (!filePath) {
-    console.error(
-      "Usage: tsx scripts/sync_sor_extract.ts <path/to/extract.xlsx> [--dry-run]"
-    );
-    process.exit(1);
-  }
-
+/**
+ * Sync the supplied SOR Extract `.xlsx` (loaded into memory as a Buffer)
+ * into the SOR Lines board. Returns a structured summary the serverless
+ * handler serialises to JSON for the browser. No console output —
+ * everything goes into the returned object.
+ */
+export async function runSyncSor(buffer: Buffer): Promise<SyncResult> {
   const start = Date.now();
-  console.log(
-    `[sor-sync] reading ${path.basename(filePath)}${dryRun ? " (dry-run)" : ""}`
-  );
-
-  const extract = await readExtract(filePath);
-  console.log(`[sor-sync] parsed ${extract.length} rows from Cons_Data`);
-
-  console.log(`[sor-sync] fetching SOR Lines from monday`);
+  const extract = await readExtract(buffer);
   const monday_rows = await fetchAllSorLines();
-  console.log(`[sor-sync] fetched ${monday_rows.length} monday rows`);
-
   const index = indexMondayRows(monday_rows);
-  console.log(`[sor-sync] indexed ${index.size} (Asset ID, SOR) pairs`);
 
-  // Diff each extract row against monday
   const diffs: RowDiff[] = [];
   let unmatched = 0;
   let unchanged = 0;
@@ -512,9 +519,6 @@ async function main() {
     const current = index.get(joinKey(ex.assetId, ex.sor));
     if (!current) {
       unmatched++;
-      console.log(
-        `[skip] no monday match: ${ex.assetId} / ${ex.sor} (sheet row ${ex.rowIndex})`
-      );
       continue;
     }
     const diff = diffRow(ex, current);
@@ -524,7 +528,6 @@ async function main() {
     }
     diffs.push(diff);
 
-    // High-signal change tracking
     if (
       diff.changedFields.includes("Cons Status") &&
       ex.consStatus === "Field Complete" &&
@@ -539,43 +542,20 @@ async function main() {
     ) {
       newPaid.push(`${ex.assetId} / ${ex.sor}`);
     }
-
-    console.log(
-      `[diff] ${current.id} ${ex.assetId} / ${ex.sor}: ${diff.changedFields.join(", ")}`
-    );
   }
 
-  console.log(
-    `\n[sor-sync] diff summary: ${diffs.length} to update, ${unchanged} unchanged, ${unmatched} unmatched`
-  );
+  const result = await applyDiffs(diffs, false);
 
-  const result = await applyDiffs(diffs, dryRun);
-
-  const elapsedSec = ((Date.now() - start) / 1000).toFixed(1);
-  console.log(
-    `\n[sor-sync] ${dryRun ? "DRY-RUN" : "APPLIED"} in ${elapsedSec}s` +
-      `\n  rows processed: ${extract.length}` +
-      `\n  monday updated: ${result.updated}` +
-      `\n  unchanged:      ${unchanged}` +
-      `\n  unmatched:      ${unmatched}` +
-      `\n  failed:         ${result.failed}` +
-      (newFieldComplete.length > 0
-        ? `\n\n  New "Field Complete" rows (${newFieldComplete.length}):\n    ${newFieldComplete.slice(0, 20).join("\n    ")}${newFieldComplete.length > 20 ? `\n    ...${newFieldComplete.length - 20} more` : ""}`
-        : "") +
-      (newPaid.length > 0
-        ? `\n\n  New "Paid" rows (${newPaid.length}):\n    ${newPaid.slice(0, 20).join("\n    ")}${newPaid.length > 20 ? `\n    ...${newPaid.length - 20} more` : ""}`
-        : "")
-  );
-
-  if (result.failures.length > 0) {
-    console.log(`\n[sor-sync] failures:`);
-    for (const f of result.failures) console.log(`  ${f}`);
-  }
-
-  if (result.failed > 0 && !dryRun) process.exit(2);
+  return {
+    rowsProcessed: extract.length,
+    toUpdate: diffs.length,
+    updated: result.updated,
+    unchanged,
+    unmatched,
+    failed: result.failed,
+    failures: result.failures,
+    newFieldComplete,
+    newPaid,
+    elapsedMs: Date.now() - start,
+  };
 }
-
-main().catch((err) => {
-  console.error("[sor-sync] FATAL:", err);
-  process.exit(1);
-});
