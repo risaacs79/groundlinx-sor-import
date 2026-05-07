@@ -41,6 +41,7 @@ const RATE_CARD_BOARD = 5028088248;
 const ACTIVE_COL = {
   ASSET_TEXT: "text_mm2tmm57",
   SAM_ADA: "text_mm2tw65k",
+  JOB_REFERENCE: "text_mm2twpfp", // "Job Reference (GL)" — script-managed GL-NNN counter
   RCTI: "text_mm2tdrdk",
   JOB_STATUS: "color_mm2tff18",
   UGL_PAYMENT_STATUS: "color_mm32x3ga",
@@ -628,9 +629,75 @@ interface ApplyResult {
   failures: string[];
 }
 
+// ---------- GL- Job Reference counter ----------
+async function fetchMaxGlNumber(): Promise<number> {
+  let cursor: string | null = null;
+  let maxN = 0;
+  for (let pg = 1; pg <= 20; pg++) {
+    const data = await monday<{
+      boards?: Array<{
+        items_page: {
+          cursor: string | null;
+          items: Array<{ column_values: Array<{ id: string; text: string | null }> }>;
+        };
+      }>;
+      next_items_page?: {
+        cursor: string | null;
+        items: Array<{ column_values: Array<{ id: string; text: string | null }> }>;
+      };
+    }>(
+      cursor
+        ? `query ($cursor: String!, $col: [String!]) {
+            next_items_page(limit: 500, cursor: $cursor) {
+              cursor items { column_values(ids: $col) { id text } }
+            }
+          }`
+        : `query ($boardId: ID!, $col: [String!]) {
+            boards(ids: [$boardId]) {
+              items_page(limit: 500) {
+                cursor items { column_values(ids: $col) { id text } }
+              }
+            }
+          }`,
+      cursor
+        ? { cursor, col: [ACTIVE_COL.JOB_REFERENCE] }
+        : {
+            boardId: String(ACTIVE_JOBS_BOARD),
+            col: [ACTIVE_COL.JOB_REFERENCE],
+          }
+    );
+    type Page = {
+      cursor: string | null;
+      items: Array<{
+        column_values: Array<{ id: string; text: string | null }>;
+      }>;
+    };
+    const page: Page = cursor
+      ? data.next_items_page!
+      : data.boards![0]!.items_page;
+    for (const item of page.items) {
+      const t = item.column_values[0]?.text;
+      if (!t) continue;
+      const m = t.match(/^GL-(\d+)$/);
+      if (m) {
+        const n = parseInt(m[1], 10);
+        if (Number.isFinite(n) && n > maxN) maxN = n;
+      }
+    }
+    if (!page.cursor) break;
+    cursor = page.cursor;
+  }
+  return maxN;
+}
+
+function formatGl(n: number): string {
+  return `GL-${String(n).padStart(3, "0")}`;
+}
+
 async function applyPlan(
   planned: PlannedItem[],
-  dryRun: boolean
+  dryRun: boolean,
+  startGlNumber: number
 ): Promise<ApplyResult> {
   const result: ApplyResult = {
     createdNetworkAssets: 0,
@@ -699,6 +766,9 @@ async function applyPlan(
     }
   }
 
+  // GL- counter — assigned only on Active Jobs creates.
+  let glCounter = startGlNumber;
+
   // Phase 2 — create job rows on the appropriate target board.
   // We use change_simple_column_value-style JSON for status by name and
   // dates. Primary Asset relation only set when networkAssetId is known.
@@ -717,6 +787,10 @@ async function applyPlan(
           [COL.ASSET_TEXT]: a.assetId,
           [COL.UGL_PAYMENT_STATUS]: { label: a.aggregatedStatus },
         };
+        if (target === "active") {
+          glCounter += 1;
+          colVals[ACTIVE_COL.JOB_REFERENCE] = formatGl(glCounter);
+        }
         // Default Job Status. Active Jobs → "Imported / New" (the existing
         // default). Approved & Paid → mirror aggregated status when it matches
         // a Job Status label there ("Approved" / "Paid"), else "Imported / New".
@@ -816,10 +890,11 @@ export async function runImportWorkOrders(
   const start = Date.now();
   const extract = await readExtract(buffer, { sheet: opts.sheet });
   const rateCard = await fetchRateCard();
-  const [existingActive, existingApproved, networkAssets] = await Promise.all([
+  const [existingActive, existingApproved, networkAssets, maxGl] = await Promise.all([
     fetchExistingAssetIds(ACTIVE_JOBS_BOARD, ACTIVE_COL.ASSET_TEXT),
     fetchExistingAssetIds(APPROVED_JOBS_BOARD, APPROVED_COL.ASSET_TEXT),
     fetchNetworkAssetMap(),
+    fetchMaxGlNumber(),
   ]);
 
   const byAsset = new Map<string, ExtractRow[]>();
@@ -849,7 +924,7 @@ export async function runImportWorkOrders(
   }
 
   const skipped = planned.filter((p) => p.skipReason);
-  const result = await applyPlan(planned, false);
+  const result = await applyPlan(planned, false, maxGl);
 
   return {
     uniqueAssets: groups.length,
