@@ -432,25 +432,52 @@ async function fetchExistingAssetIds(
 }
 
 async function fetchNetworkAssetMap(): Promise<Map<string, string>> {
-  // Asset ID (row name) -> monday item id. Network Assets rows use the
-  // human/numeric Asset ID as the row name. 147 rows currently — one page.
-  const data = await monday<{
-    boards: Array<{
-      items_page: {
+  // Asset ID (row name) -> monday item id. PAGINATES — Network Assets has
+  // 683 rows on 7 May after bulk_create_sor_lines ran; the previous
+  // single-page-of-500 fetch missed 183 rows and would have caused
+  // duplicate creates.
+  const map = new Map<string, string>();
+  let cursor: string | null = null;
+  for (let pg = 1; pg <= 20; pg++) {
+    const data = await monday<{
+      boards?: Array<{
+        items_page: {
+          cursor: string | null;
+          items: Array<{ id: string; name: string }>;
+        };
+      }>;
+      next_items_page?: {
+        cursor: string | null;
         items: Array<{ id: string; name: string }>;
       };
-    }>;
-  }>(
-    `query ($boardId: ID!) {
-      boards(ids: [$boardId]) {
-        items_page(limit: 500) { items { id name } }
-      }
-    }`,
-    { boardId: String(NETWORK_ASSETS_BOARD) }
-  );
-  const map = new Map<string, string>();
-  for (const item of data.boards?.[0]?.items_page?.items ?? []) {
-    if (item.name) map.set(item.name.trim(), item.id);
+    }>(
+      cursor
+        ? `query ($cursor: String!) {
+            next_items_page(limit: 500, cursor: $cursor) {
+              cursor items { id name }
+            }
+          }`
+        : `query ($boardId: ID!) {
+            boards(ids: [$boardId]) {
+              items_page(limit: 500) {
+                cursor items { id name }
+              }
+            }
+          }`,
+      cursor ? { cursor } : { boardId: String(NETWORK_ASSETS_BOARD) }
+    );
+    type Page = {
+      cursor: string | null;
+      items: Array<{ id: string; name: string }>;
+    };
+    const page: Page = cursor
+      ? data.next_items_page!
+      : data.boards![0]!.items_page;
+    for (const item of page.items) {
+      if (item.name) map.set(item.name.trim(), item.id);
+    }
+    if (!page.cursor) break;
+    cursor = page.cursor;
   }
   return map;
 }
