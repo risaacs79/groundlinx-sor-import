@@ -44,6 +44,7 @@ const ACTIVE_COL = {
   JOB_REFERENCE: "text_mm2twpfp", // "Job Reference (GL)" — script-managed GL-NNN counter
   RCTI: "text_mm2tdrdk",
   JOB_STATUS: "color_mm2tff18",
+  JOB_TYPE: "color_mm2tq4cc",
   UGL_PAYMENT_STATUS: "color_mm32x3ga",
   PROJECT: "board_relation_mm2tzeaj", // → Projects board (5028084549)
   LOCATION: "location_mm2tm61g",
@@ -61,6 +62,7 @@ const APPROVED_COL = {
   SAM_ADA: "text_mm32z5ej",
   RCTI: "text_mm32c4fj",
   JOB_STATUS: "color_mm329x8a",
+  JOB_TYPE: "color_mm32wtdz",
   UGL_PAYMENT_STATUS: "color_mm322s90",
   PROJECT: "board_relation_mm32fmsp", // → Projects board (5028084549)
   LOCATION: "location_mm32tb6n",
@@ -156,6 +158,8 @@ interface AssetGroup {
   ada: string | null;
   /** First non-null address from rows (only present in work-allocation files) */
   address: string | null;
+  /** Derived Job Type label from SOR composition. null if no recognised SORs. */
+  jobType: string | null;
 }
 
 interface PlannedItem {
@@ -371,8 +375,11 @@ async function readExtract(
 }
 
 // ---------- Rate Card lookup ----------
-async function fetchRateCard(): Promise<Map<string, string>> {
-  // SOR Code -> Item Name
+interface RateCardEntry {
+  name: string;
+  category: string | null;
+}
+async function fetchRateCard(): Promise<Map<string, RateCardEntry>> {
   const data = await monday<{
     boards: Array<{
       items_page: {
@@ -389,22 +396,61 @@ async function fetchRateCard(): Promise<Map<string, string>> {
         items_page(limit: 500) {
           items {
             id name
-            column_values(ids: ["${RATE_CARD_COL.SOR_CODE}"]) { id text }
+            column_values(ids: ["${RATE_CARD_COL.SOR_CODE}", "color_mm2twxv0"]) { id text }
           }
         }
       }
     }`,
     { boardId: String(RATE_CARD_BOARD) }
   );
-  const map = new Map<string, string>();
+  const map = new Map<string, RateCardEntry>();
   for (const item of data.boards?.[0]?.items_page?.items ?? []) {
-    const sorCode = item.column_values.find((c) => c.id === RATE_CARD_COL.SOR_CODE)
-      ?.text;
+    const cv: Record<string, string | null> = {};
+    for (const c of item.column_values) cv[c.id] = c.text;
+    const sorCode = cv[RATE_CARD_COL.SOR_CODE];
     if (sorCode && item.name) {
-      map.set(sorCode.trim().toUpperCase(), item.name.trim());
+      map.set(sorCode.trim().toUpperCase(), {
+        name: item.name.trim(),
+        category: cv["color_mm2twxv0"]?.trim() || null,
+      });
     }
   }
   return map;
+}
+
+// ---------- Job Type derivation (mirrors main repo) ----------
+function categorizeSor(sorCode: string, category: string | null): string {
+  const code = sorCode.trim().toUpperCase();
+  if (code === "CW-02-01-08") return "lid";
+  switch (category) {
+    case "Pit Install":
+      return "pit";
+    case "Pit Removal":
+      return "acm";
+    case "Duct Install":
+    case "Core Bore":
+      return "duct";
+    default:
+      return "other";
+  }
+}
+
+function deriveJobType(kinds: Set<string>): string | null {
+  if (kinds.size === 0) return null;
+  const recognised = new Set(Array.from(kinds).filter((k) => k !== "other"));
+  if (recognised.size === 0) return "Combined";
+  if (recognised.size === 1) {
+    const only = recognised.values().next().value;
+    if (only === "pit") return "New Pit";
+    if (only === "acm") return "ACM Removal";
+    if (only === "lid") return "Lid Replacement";
+    if (only === "duct") return "Pending";
+    return "Combined";
+  }
+  if (recognised.size === 2 && recognised.has("pit") && recognised.has("acm")) {
+    return "ACM Pit + New Pit";
+  }
+  return "Combined";
 }
 
 // ---------- Existing Asset IDs on target boards (for idempotency) ----------
@@ -526,12 +572,13 @@ function deriveAssetClass(assetId: string): string | null {
 function aggregateAsset(
   assetId: string,
   rows: ExtractRow[],
-  rateCard: Map<string, string>
+  rateCard: Map<string, RateCardEntry>
 ): AssetGroup {
   const sorCodes: string[] = [];
   const seenSor = new Set<string>();
   const itemNames: string[] = [];
   const seenName = new Set<string>();
+  const sorKinds = new Set<string>();
   const commentParts: string[] = [];
   let aggStatus = "";
   let aggIdx = 999;
@@ -546,11 +593,12 @@ function aggregateAsset(
     if (!seenSor.has(r.sor)) {
       seenSor.add(r.sor);
       sorCodes.push(r.sor);
-      const name = rateCard.get(r.sor.trim().toUpperCase());
-      if (name && !seenName.has(name)) {
-        seenName.add(name);
-        itemNames.push(name);
+      const entry = rateCard.get(r.sor.trim().toUpperCase());
+      if (entry?.name && !seenName.has(entry.name)) {
+        seenName.add(entry.name);
+        itemNames.push(entry.name);
       }
+      sorKinds.add(categorizeSor(r.sor, entry?.category ?? null));
     }
     const idx = priorityOf(r.sorStatus);
     if (idx < aggIdx) {
@@ -593,6 +641,7 @@ function aggregateAsset(
     projectId,
     ada,
     address,
+    jobType: deriveJobType(sorKinds),
   };
 }
 
@@ -887,6 +936,10 @@ async function applyPlan(
         if (a.address) {
           colVals[COL.LOCATION] = { lat: 0, lng: 0, address: a.address };
         }
+        // Job Type — derived closed-list value from deriveJobType.
+        if (a.jobType) {
+          colVals[COL.JOB_TYPE] = { label: a.jobType };
+        }
         if (target === "active" && p.networkAssetId) {
           colVals[COL.PRIMARY_ASSET] = {
             item_ids: [parseInt(p.networkAssetId, 10)],
@@ -897,7 +950,7 @@ async function applyPlan(
             board_id: $boardId,
             item_name: $name${j},
             column_values: $cv${j},
-            create_labels_if_missing: false
+            create_labels_if_missing: true
           ) { id }`
         );
         variables[`name${j}`] = p.name;
