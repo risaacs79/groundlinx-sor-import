@@ -509,6 +509,33 @@ async function fetchRateCard(): Promise<Map<string, RateCardEntry>> {
   return map;
 }
 
+// ---------- Design Qty defensive default (mirrors main repo) ----------
+function defaultDesignQty(
+  rawQty: number | null,
+  uom: string | null | undefined,
+  ctx: { sorCode: string; assetId: string }
+): number | null {
+  if (rawQty != null) return rawQty;
+  if (!uom) {
+    console.warn(
+      `[import-jobs] WARNING: Design Qty blank with no UOM — assetId=${ctx.assetId} sor=${ctx.sorCode} (left null; needs manual fill)`
+    );
+    return null;
+  }
+  const u = uom.trim().toLowerCase();
+  if (
+    u.includes("per pit") ||
+    u.startsWith("each") ||
+    u.includes("per core bore")
+  ) {
+    return 1;
+  }
+  console.warn(
+    `[import-jobs] WARNING: Design Qty blank for non-unit UOM — assetId=${ctx.assetId} sor=${ctx.sorCode} uom="${uom}" (left null; needs manual fill from UGL source)`
+  );
+  return null;
+}
+
 // ---------- Job Type derivation (mirrors main repo) ----------
 function categorizeSor(sorCode: string, category: string | null): string {
   const code = sorCode.trim().toUpperCase();
@@ -742,7 +769,11 @@ function aggregateAsset(
     ada,
     address,
     jobType: deriveJobType(sorKinds),
-    primaryDesignQty: rows[0]?.designQty ?? null,
+    primaryDesignQty: defaultDesignQty(
+      rows[0]?.designQty ?? null,
+      rateCard.get(rows[0]?.sor.trim().toUpperCase() ?? "")?.uom ?? null,
+      { sorCode: rows[0]?.sor ?? "", assetId }
+    ),
     primaryUom: rateCard.get(rows[0]?.sor.trim().toUpperCase() ?? "")?.uom ?? null,
   };
 }
