@@ -883,8 +883,9 @@ async function applyPlan(
           }
         }
         // Location — only present in work-allocation files (K-2CSN-21 etc.)
+        // monday requires {lat, lng, address} — lat=0/lng=0 are placeholders.
         if (a.address) {
-          colVals[COL.LOCATION] = { address: a.address };
+          colVals[COL.LOCATION] = { lat: 0, lng: 0, address: a.address };
         }
         if (target === "active" && p.networkAssetId) {
           colVals[COL.PRIMARY_ASSET] = {
