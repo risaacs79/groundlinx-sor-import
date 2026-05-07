@@ -41,9 +41,13 @@ const RATE_CARD_BOARD = 5028088248;
 const ACTIVE_COL = {
   ASSET_TEXT: "text_mm2tmm57",
   SAM_ADA: "text_mm2tw65k",
+  JOB_REFERENCE: "text_mm2twpfp", // "Job Reference (GL)" — script-managed GL-NNN counter
   RCTI: "text_mm2tdrdk",
   JOB_STATUS: "color_mm2tff18",
+  JOB_TYPE: "color_mm2tq4cc",
   UGL_PAYMENT_STATUS: "color_mm32x3ga",
+  PROJECT: "board_relation_mm2tzeaj", // → Projects board (5028084549)
+  LOCATION: "location_mm2tm61g",
   PRIMARY_ASSET: "board_relation_mm2tyedq",
   JOB_START_DATE: "date_mm2t1bck",
   DATE_SUBMITTED: "date_mm2tm5wk",
@@ -58,13 +62,21 @@ const APPROVED_COL = {
   SAM_ADA: "text_mm32z5ej",
   RCTI: "text_mm32c4fj",
   JOB_STATUS: "color_mm329x8a",
+  JOB_TYPE: "color_mm32wtdz",
   UGL_PAYMENT_STATUS: "color_mm322s90",
+  PROJECT: "board_relation_mm32fmsp", // → Projects board (5028084549)
+  LOCATION: "location_mm32tb6n",
   PRIMARY_ASSET: "board_relation_mm32kh12",
   JOB_START_DATE: "date_mm32d4s9",
   DATE_SUBMITTED: "date_mm32cc9k",
   DATE_APPROVED: "date_mm32p2b7",
   DATE_PAID: "date_mm32cjpd",
   QUICK_NOTE: "long_text_mm3277sp",
+};
+
+const PROJECTS_BOARD = 5028084549;
+const PROJECTS_COL = {
+  PROJECT_CODE: "text_mm2t1s7a",
 };
 
 // Network Assets columns
@@ -122,6 +134,7 @@ interface ExtractRow {
   constructionDate: string | null; // ISO YYYY-MM-DD
   reviewDate: string | null;
   comments: string | null;
+  address: string | null;
 }
 
 interface AssetGroup {
@@ -143,6 +156,14 @@ interface AssetGroup {
   /** First non-null Project ID / SAM / ADA from rows */
   projectId: string | null;
   ada: string | null;
+  /** First non-null address from rows (only present in work-allocation files) */
+  address: string | null;
+  /** Derived Job Type label from SOR composition. null if no recognised SORs. */
+  jobType: string | null;
+  /** First-SOR Design Qty (only meaningful for single-SOR assets). */
+  primaryDesignQty: number | null;
+  /** First-SOR UOM string (only meaningful for single-SOR assets). */
+  primaryUom: string | null;
 }
 
 interface PlannedItem {
@@ -240,79 +261,130 @@ function cellDateIso(v: ExcelJS.CellValue): string | null {
   return null;
 }
 
-async function readExtract(source: string | Buffer): Promise<ExtractRow[]> {
+/**
+ * Header alias map — supports both the daily SOR Extract (sheet "Cons_Data",
+ * Title Case headers) and work-allocation files like K-2CSN-21 (sheet "Sheet1",
+ * snake_case headers). Required: only assetId + sor.
+ */
+const HEADER_ALIASES: Record<string, string[]> = {
+  assetId: ["Asset ID", "id"],
+  sor: ["SOR", "item_code"],
+  sorDescription: ["SOR Description", "description"],
+  projectId: ["Project ID", "project_id"],
+  ada: ["ADA", "ada"],
+  designQty: ["Design Qty", "design_qty"],
+  actualQty: ["Actual Qty", "actual_qty"],
+  acceptedQty: ["accepted_qty", "Accepted Qty"],
+  consStatus: ["Cons Status"],
+  sorStatus: ["SOR Status", "ugl_sor_status"],
+  invoiceNo: ["Invoice #", "invoice_id"],
+  constructionDate: ["construction_date", "Construction Date", "build_date_sor"],
+  reviewDate: ["review_date", "Review Date"],
+  comments: ["comments", "Comments", "VA Comments"],
+  address: ["address", "Address"],
+};
+
+const REQUIRED_FIELDS = ["assetId", "sor"] as const;
+
+interface ReadOptions {
+  /** Override sheet name. If unset, tries "Cons_Data" then "Sheet1". */
+  sheet?: string;
+}
+
+async function readExtract(
+  source: string | Buffer,
+  opts: ReadOptions = {}
+): Promise<ExtractRow[]> {
   const wb = new ExcelJS.Workbook();
   if (typeof source === "string") {
     await wb.xlsx.readFile(source);
   } else {
-    // ExcelJS's typings reject the generic Node Buffer<ArrayBufferLike>
-    // shape new @types/node ships — copy into a fresh ArrayBuffer so the
-    // call type-checks under strict mode without a runtime cast.
     const ab = source.buffer.slice(
       source.byteOffset,
       source.byteOffset + source.byteLength
     ) as ArrayBuffer;
     await wb.xlsx.load(ab);
   }
-  const ws = wb.getWorksheet("Cons_Data");
-  if (!ws) throw new Error("Cons_Data sheet not found");
+
+  let ws: ExcelJS.Worksheet | undefined;
+  if (opts.sheet) {
+    ws = wb.getWorksheet(opts.sheet);
+    if (!ws) throw new Error(`Sheet "${opts.sheet}" not found`);
+  } else {
+    ws = wb.getWorksheet("Cons_Data") ?? wb.getWorksheet("Sheet1");
+    if (!ws) {
+      throw new Error(
+        `No "Cons_Data" or "Sheet1" sheet found — pass sheet override`
+      );
+    }
+  }
 
   const header: Record<string, number> = {};
   ws.getRow(1).eachCell((cell, col) => {
     const t = cellText(cell.value);
     if (t) header[t] = col;
   });
-  const required = [
-    "Asset ID",
-    "SOR",
-    "SOR Description",
-    "Project ID",
-    "ADA",
-    "Design Qty",
-    "Actual Qty",
-    "accepted_qty",
-    "Cons Status",
-    "SOR Status",
-    "Invoice #",
-    "construction_date",
-    "review_date",
-    "comments",
-  ];
-  for (const name of required) {
-    if (!header[name]) throw new Error(`Missing column "${name}" in Cons_Data`);
+
+  const colByField: Record<string, number | null> = {};
+  for (const [field, aliases] of Object.entries(HEADER_ALIASES)) {
+    let col: number | null = null;
+    for (const alias of aliases) {
+      if (header[alias]) {
+        col = header[alias];
+        break;
+      }
+    }
+    colByField[field] = col;
+  }
+
+  for (const field of REQUIRED_FIELDS) {
+    if (colByField[field] == null) {
+      const aliases = HEADER_ALIASES[field].join(" / ");
+      throw new Error(
+        `No column found for "${field}" — accepted aliases: ${aliases}. Sheet "${ws.name}" headers: ${Object.keys(header).slice(0, 25).join(", ")}${Object.keys(header).length > 25 ? ", ..." : ""}`
+      );
+    }
   }
 
   const rows: ExtractRow[] = [];
   for (let r = 2; r <= ws.rowCount; r++) {
     const row = ws.getRow(r);
-    const get = (name: string) => row.getCell(header[name]).value;
-    const assetId = cellText(get("Asset ID"));
-    const sor = cellText(get("SOR"));
+    const getCell = (field: string) => {
+      const col = colByField[field];
+      return col == null ? null : row.getCell(col).value;
+    };
+    const assetId = cellText(getCell("assetId"));
+    const sor = cellText(getCell("sor"));
     if (!assetId || !sor) continue;
     rows.push({
       rowIndex: r,
-      projectId: cellText(get("Project ID")),
-      ada: cellText(get("ADA")),
+      projectId: cellText(getCell("projectId")),
+      ada: cellText(getCell("ada")),
       assetId,
       sor,
-      sorDescription: cellText(get("SOR Description")),
-      designQty: cellNumber(get("Design Qty")),
-      actualQty: cellNumber(get("Actual Qty")),
-      acceptedQty: cellNumber(get("accepted_qty")),
-      consStatus: cellText(get("Cons Status")),
-      sorStatus: cellText(get("SOR Status")),
-      invoiceNo: cellText(get("Invoice #")),
-      constructionDate: cellDateIso(get("construction_date")),
-      reviewDate: cellDateIso(get("review_date")),
-      comments: cellText(get("comments")),
+      sorDescription: cellText(getCell("sorDescription")),
+      designQty: cellNumber(getCell("designQty")),
+      actualQty: cellNumber(getCell("actualQty")),
+      acceptedQty: cellNumber(getCell("acceptedQty")),
+      consStatus: cellText(getCell("consStatus")),
+      sorStatus: cellText(getCell("sorStatus")),
+      invoiceNo: cellText(getCell("invoiceNo")),
+      constructionDate: cellDateIso(getCell("constructionDate")),
+      reviewDate: cellDateIso(getCell("reviewDate")),
+      comments: cellText(getCell("comments")),
+      address: cellText(getCell("address")),
     });
   }
   return rows;
 }
 
 // ---------- Rate Card lookup ----------
-async function fetchRateCard(): Promise<Map<string, string>> {
-  // SOR Code -> Item Name
+interface RateCardEntry {
+  name: string;
+  category: string | null;
+  uom: string | null;
+}
+async function fetchRateCard(): Promise<Map<string, RateCardEntry>> {
   const data = await monday<{
     boards: Array<{
       items_page: {
@@ -329,22 +401,62 @@ async function fetchRateCard(): Promise<Map<string, string>> {
         items_page(limit: 500) {
           items {
             id name
-            column_values(ids: ["${RATE_CARD_COL.SOR_CODE}"]) { id text }
+            column_values(ids: ["${RATE_CARD_COL.SOR_CODE}", "color_mm2twxv0", "text_mm2t76yv"]) { id text }
           }
         }
       }
     }`,
     { boardId: String(RATE_CARD_BOARD) }
   );
-  const map = new Map<string, string>();
+  const map = new Map<string, RateCardEntry>();
   for (const item of data.boards?.[0]?.items_page?.items ?? []) {
-    const sorCode = item.column_values.find((c) => c.id === RATE_CARD_COL.SOR_CODE)
-      ?.text;
+    const cv: Record<string, string | null> = {};
+    for (const c of item.column_values) cv[c.id] = c.text;
+    const sorCode = cv[RATE_CARD_COL.SOR_CODE];
     if (sorCode && item.name) {
-      map.set(sorCode.trim().toUpperCase(), item.name.trim());
+      map.set(sorCode.trim().toUpperCase(), {
+        name: item.name.trim(),
+        category: cv["color_mm2twxv0"]?.trim() || null,
+        uom: cv["text_mm2t76yv"]?.trim() || null,
+      });
     }
   }
   return map;
+}
+
+// ---------- Job Type derivation (mirrors main repo) ----------
+function categorizeSor(sorCode: string, category: string | null): string {
+  const code = sorCode.trim().toUpperCase();
+  if (code === "CW-02-01-08") return "lid";
+  switch (category) {
+    case "Pit Install":
+      return "pit";
+    case "Pit Removal":
+      return "acm";
+    case "Duct Install":
+    case "Core Bore":
+      return "duct";
+    default:
+      return "other";
+  }
+}
+
+function deriveJobType(kinds: Set<string>): string | null {
+  if (kinds.size === 0) return null;
+  const recognised = new Set(Array.from(kinds).filter((k) => k !== "other"));
+  if (recognised.size === 0) return "Combined";
+  if (recognised.size === 1) {
+    const only = recognised.values().next().value;
+    if (only === "pit") return "New Pit";
+    if (only === "acm") return "ACM Removal";
+    if (only === "lid") return "Lid Replacement";
+    if (only === "duct") return "Pending";
+    return "Combined";
+  }
+  if (recognised.size === 2 && recognised.has("pit") && recognised.has("acm")) {
+    return "ACM Pit + New Pit";
+  }
+  return "Combined";
 }
 
 // ---------- Existing Asset IDs on target boards (for idempotency) ----------
@@ -387,25 +499,52 @@ async function fetchExistingAssetIds(
 }
 
 async function fetchNetworkAssetMap(): Promise<Map<string, string>> {
-  // Asset ID (row name) -> monday item id. Network Assets rows use the
-  // human/numeric Asset ID as the row name. 147 rows currently — one page.
-  const data = await monday<{
-    boards: Array<{
-      items_page: {
+  // Asset ID (row name) -> monday item id. PAGINATES — Network Assets has
+  // 683 rows on 7 May after bulk_create_sor_lines ran; the previous
+  // single-page-of-500 fetch missed 183 rows and would have caused
+  // duplicate creates.
+  const map = new Map<string, string>();
+  let cursor: string | null = null;
+  for (let pg = 1; pg <= 20; pg++) {
+    const data = await monday<{
+      boards?: Array<{
+        items_page: {
+          cursor: string | null;
+          items: Array<{ id: string; name: string }>;
+        };
+      }>;
+      next_items_page?: {
+        cursor: string | null;
         items: Array<{ id: string; name: string }>;
       };
-    }>;
-  }>(
-    `query ($boardId: ID!) {
-      boards(ids: [$boardId]) {
-        items_page(limit: 500) { items { id name } }
-      }
-    }`,
-    { boardId: String(NETWORK_ASSETS_BOARD) }
-  );
-  const map = new Map<string, string>();
-  for (const item of data.boards?.[0]?.items_page?.items ?? []) {
-    if (item.name) map.set(item.name.trim(), item.id);
+    }>(
+      cursor
+        ? `query ($cursor: String!) {
+            next_items_page(limit: 500, cursor: $cursor) {
+              cursor items { id name }
+            }
+          }`
+        : `query ($boardId: ID!) {
+            boards(ids: [$boardId]) {
+              items_page(limit: 500) {
+                cursor items { id name }
+              }
+            }
+          }`,
+      cursor ? { cursor } : { boardId: String(NETWORK_ASSETS_BOARD) }
+    );
+    type Page = {
+      cursor: string | null;
+      items: Array<{ id: string; name: string }>;
+    };
+    const page: Page = cursor
+      ? data.next_items_page!
+      : data.boards![0]!.items_page;
+    for (const item of page.items) {
+      if (item.name) map.set(item.name.trim(), item.id);
+    }
+    if (!page.cursor) break;
+    cursor = page.cursor;
   }
   return map;
 }
@@ -439,12 +578,13 @@ function deriveAssetClass(assetId: string): string | null {
 function aggregateAsset(
   assetId: string,
   rows: ExtractRow[],
-  rateCard: Map<string, string>
+  rateCard: Map<string, RateCardEntry>
 ): AssetGroup {
   const sorCodes: string[] = [];
   const seenSor = new Set<string>();
   const itemNames: string[] = [];
   const seenName = new Set<string>();
+  const sorKinds = new Set<string>();
   const commentParts: string[] = [];
   let aggStatus = "";
   let aggIdx = 999;
@@ -453,16 +593,18 @@ function aggregateAsset(
   let rctiNumber: string | null = null;
   let projectId: string | null = null;
   let ada: string | null = null;
+  let address: string | null = null;
 
   for (const r of rows) {
     if (!seenSor.has(r.sor)) {
       seenSor.add(r.sor);
       sorCodes.push(r.sor);
-      const name = rateCard.get(r.sor.trim().toUpperCase());
-      if (name && !seenName.has(name)) {
-        seenName.add(name);
-        itemNames.push(name);
+      const entry = rateCard.get(r.sor.trim().toUpperCase());
+      if (entry?.name && !seenName.has(entry.name)) {
+        seenName.add(entry.name);
+        itemNames.push(entry.name);
       }
+      sorKinds.add(categorizeSor(r.sor, entry?.category ?? null));
     }
     const idx = priorityOf(r.sorStatus);
     if (idx < aggIdx) {
@@ -478,18 +620,19 @@ function aggregateAsset(
     if (!rctiNumber && r.invoiceNo) rctiNumber = r.invoiceNo;
     if (!projectId && r.projectId) projectId = r.projectId;
     if (!ada && r.ada) ada = r.ada;
+    if (!address && r.address) address = r.address;
     if (r.comments && r.comments.trim()) {
       const tagged = `[${r.sor}] ${r.comments.trim()}`;
       if (!commentParts.includes(tagged)) commentParts.push(tagged);
     }
   }
 
-  // Empty status → fall back to Cons Status if any row has Pending Construction
-  if (!aggStatus) {
-    const consPending = rows.find((r) => r.consStatus === "Pending");
-    if (consPending) aggStatus = "Pending Construction";
-    else aggStatus = "Pending"; // ultimate fallback
-  }
+  // Empty SOR Status → fall back to "Pending Construction" (a valid label on
+  // both UGL Payment Status columns). Previously fell back to "Pending" which
+  // monday's create_item silently rejects, dropping rows on the floor. This is
+  // why ~103 of 113 K-2CSN-21 Casino assets ended up missing from both job
+  // boards after the 27 Apr import — see fix/import-jobs-pending-construction-default.
+  if (!aggStatus) aggStatus = "Pending Construction";
 
   return {
     assetId,
@@ -503,6 +646,10 @@ function aggregateAsset(
     comments: commentParts.join("\n\n"),
     projectId,
     ada,
+    address,
+    jobType: deriveJobType(sorKinds),
+    primaryDesignQty: rows[0]?.designQty ?? null,
+    primaryUom: rateCard.get(rows[0]?.sor.trim().toUpperCase() ?? "")?.uom ?? null,
   };
 }
 
@@ -527,7 +674,12 @@ function planAssets(
     const isPendingCons = a.aggregatedStatus === "Pending Construction";
     const needsNetworkAsset = isPendingCons && !networkAssetId;
 
-    const name = buildJobName(a.itemNames, a.assetId, null);
+    const name = buildJobName({
+      sorItemNames: a.itemNames,
+      assetIdText: a.assetId,
+      designQty: a.primaryDesignQty,
+      uom: a.primaryUom,
+    });
 
     let skipReason: string | null = null;
     if (existingSet.has(a.assetId)) {
@@ -556,9 +708,108 @@ interface ApplyResult {
   failures: string[];
 }
 
+// ---------- Projects map ----------
+async function fetchProjectMap(): Promise<Map<string, string>> {
+  const data = await monday<{
+    boards: Array<{
+      items_page: {
+        items: Array<{
+          id: string;
+          column_values: Array<{ id: string; text: string | null }>;
+        }>;
+      };
+    }>;
+  }>(
+    `query ($boardId: ID!, $col: [String!]) {
+      boards(ids: [$boardId]) {
+        items_page(limit: 200) { items { id column_values(ids: $col) { id text } } }
+      }
+    }`,
+    {
+      boardId: String(PROJECTS_BOARD),
+      col: [PROJECTS_COL.PROJECT_CODE],
+    }
+  );
+  const map = new Map<string, string>();
+  for (const item of data.boards?.[0]?.items_page?.items ?? []) {
+    const code = item.column_values.find(
+      (c) => c.id === PROJECTS_COL.PROJECT_CODE
+    )?.text;
+    if (code) map.set(code.trim(), item.id);
+  }
+  return map;
+}
+
+// ---------- GL- Job Reference counter ----------
+async function fetchMaxGlNumber(): Promise<number> {
+  let cursor: string | null = null;
+  let maxN = 0;
+  for (let pg = 1; pg <= 20; pg++) {
+    const data = await monday<{
+      boards?: Array<{
+        items_page: {
+          cursor: string | null;
+          items: Array<{ column_values: Array<{ id: string; text: string | null }> }>;
+        };
+      }>;
+      next_items_page?: {
+        cursor: string | null;
+        items: Array<{ column_values: Array<{ id: string; text: string | null }> }>;
+      };
+    }>(
+      cursor
+        ? `query ($cursor: String!, $col: [String!]) {
+            next_items_page(limit: 500, cursor: $cursor) {
+              cursor items { column_values(ids: $col) { id text } }
+            }
+          }`
+        : `query ($boardId: ID!, $col: [String!]) {
+            boards(ids: [$boardId]) {
+              items_page(limit: 500) {
+                cursor items { column_values(ids: $col) { id text } }
+              }
+            }
+          }`,
+      cursor
+        ? { cursor, col: [ACTIVE_COL.JOB_REFERENCE] }
+        : {
+            boardId: String(ACTIVE_JOBS_BOARD),
+            col: [ACTIVE_COL.JOB_REFERENCE],
+          }
+    );
+    type Page = {
+      cursor: string | null;
+      items: Array<{
+        column_values: Array<{ id: string; text: string | null }>;
+      }>;
+    };
+    const page: Page = cursor
+      ? data.next_items_page!
+      : data.boards![0]!.items_page;
+    for (const item of page.items) {
+      const t = item.column_values[0]?.text;
+      if (!t) continue;
+      const m = t.match(/^GL-(\d+)$/);
+      if (m) {
+        const n = parseInt(m[1], 10);
+        if (Number.isFinite(n) && n > maxN) maxN = n;
+      }
+    }
+    if (!page.cursor) break;
+    cursor = page.cursor;
+  }
+  return maxN;
+}
+
+function formatGl(n: number): string {
+  return `GL-${String(n).padStart(3, "0")}`;
+}
+
 async function applyPlan(
   planned: PlannedItem[],
-  dryRun: boolean
+  dryRun: boolean,
+  startGlNumber: number,
+  projectMap: Map<string, string>
 ): Promise<ApplyResult> {
   const result: ApplyResult = {
     createdNetworkAssets: 0,
@@ -627,6 +878,9 @@ async function applyPlan(
     }
   }
 
+  // GL- counter — assigned only on Active Jobs creates.
+  let glCounter = startGlNumber;
+
   // Phase 2 — create job rows on the appropriate target board.
   // We use change_simple_column_value-style JSON for status by name and
   // dates. Primary Asset relation only set when networkAssetId is known.
@@ -645,6 +899,20 @@ async function applyPlan(
           [COL.ASSET_TEXT]: a.assetId,
           [COL.UGL_PAYMENT_STATUS]: { label: a.aggregatedStatus },
         };
+        if (target === "active") {
+          glCounter += 1;
+          colVals[ACTIVE_COL.JOB_REFERENCE] = formatGl(glCounter);
+        }
+        // Default Job Status. Active Jobs → "Imported / New" (the existing
+        // default). Approved & Paid → mirror aggregated status when it matches
+        // a Job Status label there ("Approved" / "Paid"), else "Imported / New".
+        if (target === "active") {
+          colVals[COL.JOB_STATUS] = { label: "Imported / New" };
+        } else if (a.aggregatedStatus === "Approved" || a.aggregatedStatus === "Paid") {
+          colVals[COL.JOB_STATUS] = { label: a.aggregatedStatus };
+        } else {
+          colVals[COL.JOB_STATUS] = { label: "Imported / New" };
+        }
         if (a.ada) colVals[COL.SAM_ADA] = a.ada;
         if (a.rctiNumber) colVals[COL.RCTI] = a.rctiNumber;
         if (a.latestConstructionDate) {
@@ -667,6 +935,24 @@ async function applyPlan(
           }
         }
         if (a.comments) colVals[COL.QUICK_NOTE] = a.comments;
+        // Project relation — look up Projects board item id by full project code
+        if (a.projectId) {
+          const projectMondayId = projectMap.get(a.projectId.trim());
+          if (projectMondayId) {
+            colVals[COL.PROJECT] = {
+              item_ids: [parseInt(projectMondayId, 10)],
+            };
+          }
+        }
+        // Location — only present in work-allocation files (K-2CSN-21 etc.)
+        // monday requires {lat, lng, address} — lat=0/lng=0 are placeholders.
+        if (a.address) {
+          colVals[COL.LOCATION] = { lat: 0, lng: 0, address: a.address };
+        }
+        // Job Type — derived closed-list value from deriveJobType.
+        if (a.jobType) {
+          colVals[COL.JOB_TYPE] = { label: a.jobType };
+        }
         if (target === "active" && p.networkAssetId) {
           colVals[COL.PRIMARY_ASSET] = {
             item_ids: [parseInt(p.networkAssetId, 10)],
@@ -677,7 +963,7 @@ async function applyPlan(
             board_id: $boardId,
             item_name: $name${j},
             column_values: $cv${j},
-            create_labels_if_missing: false
+            create_labels_if_missing: true
           ) { id }`
         );
         variables[`name${j}`] = p.name;
@@ -722,14 +1008,24 @@ export interface ImportResult {
  * Returns a structured summary the serverless handler serialises to
  * JSON for the browser. No console output.
  */
-export async function runImportWorkOrders(buffer: Buffer): Promise<ImportResult> {
+export interface RunImportOptions {
+  /** Override sheet name. Defaults: "Cons_Data" then "Sheet1". */
+  sheet?: string;
+}
+
+export async function runImportWorkOrders(
+  buffer: Buffer,
+  opts: RunImportOptions = {}
+): Promise<ImportResult> {
   const start = Date.now();
-  const extract = await readExtract(buffer);
+  const extract = await readExtract(buffer, { sheet: opts.sheet });
   const rateCard = await fetchRateCard();
-  const [existingActive, existingApproved, networkAssets] = await Promise.all([
+  const [existingActive, existingApproved, networkAssets, maxGl, projectMap] = await Promise.all([
     fetchExistingAssetIds(ACTIVE_JOBS_BOARD, ACTIVE_COL.ASSET_TEXT),
     fetchExistingAssetIds(APPROVED_JOBS_BOARD, APPROVED_COL.ASSET_TEXT),
     fetchNetworkAssetMap(),
+    fetchMaxGlNumber(),
+    fetchProjectMap(),
   ]);
 
   const byAsset = new Map<string, ExtractRow[]>();
@@ -759,7 +1055,7 @@ export async function runImportWorkOrders(buffer: Buffer): Promise<ImportResult>
   }
 
   const skipped = planned.filter((p) => p.skipReason);
-  const result = await applyPlan(planned, false);
+  const result = await applyPlan(planned, false, maxGl, projectMap);
 
   return {
     uniqueAssets: groups.length,

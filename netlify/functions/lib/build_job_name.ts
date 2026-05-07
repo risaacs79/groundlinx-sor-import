@@ -1,57 +1,59 @@
 /**
  * Build the canonical monday item-name for an Active Jobs / Approved & Paid
- * Jobs row from the rate-card SOR item names, asset id text, and address.
+ * Jobs row.
  *
- * Format (locked in Step 1.6):
+ * Three cases (Priority 5 Option Z, May 2026 — SOR-first, Asset ID last):
  *
- *   <Item names joined with " - "> - <Asset ID> - <Address>
+ *   1. Single SOR, Design Qty > 1
+ *        {qty}{UOM_short} - {SOR Friendly Name} - {Asset ID}
+ *      e.g. "28m - DUCT - 50mm - Cat 1 - OTR - 2URL-20-06-DCT-782"
  *
- * Example with two SORs:
+ *   2. Single SOR, Design Qty <= 1 (qty prefix dropped — "1 pit" adds no info)
+ *        {SOR Friendly Name} - {Asset ID}
  *
- *   N2P - Install P5 Pit - N2P - Remove ACM P4/P5
- *     - 000000003200512558 - 15 LANCASTER AV CASINO
+ *   3. Multi-SOR (2+ SORs on the same asset)
+ *        {SOR1} + {SOR2} [+ {SOR3} ...] - {Asset ID}
+ *      e.g. "Install P5 Pit + Removal ACM P4/P5 - 000000003206233104"
  *
- * Notes
- * -----
- * - Joiner is " - " (space, hyphen-minus, space). The brief uses hyphen
- *   for both the joiner and within the SOR labels themselves; the visual
- *   reads cleanly because the spacing is consistent across both.
- * - The field app's StackedAssetTitle stacks the same data spatially
- *   (Asset ID first, Item names below, Address at the bottom). The
- *   monday item name is a single string so it's ordered with item names
- *   first — that puts the work nature as the leading sortable token in
- *   monday's grid view.
- * - Empty / null parts are dropped so the result never has trailing or
- *   doubled separators ("X -  - Y", "X - " etc.).
- *
- * Used by:
- * - scripts/sync_sor_extract.ts (Step 2 work order import — names new
- *   Active Jobs and Approved rows)
- * - any future bulk-create utilities that need consistent item names
+ * Mirror of scripts/lib/build_job_name.ts in the main field-app repo.
  */
-export function buildJobName(
-  sorItemNames: string[],
-  assetIdText: string,
-  address: string | null
-): string {
-  const parts: string[] = [];
 
-  for (const name of sorItemNames) {
-    if (name && name.trim()) parts.push(name.trim());
+export interface JobNameInput {
+  sorItemNames: string[];
+  assetIdText: string;
+  designQty?: number | null;
+  uom?: string | null;
+}
+
+function shortUom(uom: string | null | undefined): string {
+  if (!uom) return "";
+  const u = uom.trim().toLowerCase();
+  if (u.includes("metre") || u.includes("meter")) return "m";
+  if (u.includes("pit")) return "pit";
+  if (u.includes("core bore")) return "core bore";
+  if (u.startsWith("each")) return "each";
+  return u.replace(/^per\s+/, "");
+}
+
+export function buildJobName(input: JobNameInput): string {
+  const sorNames = input.sorItemNames
+    .filter((n) => n && n.trim())
+    .map((n) => n.trim());
+  const asset = input.assetIdText?.trim() ?? "";
+
+  if (sorNames.length === 0 || !asset) {
+    return asset || sorNames.join(" + ") || "(unnamed)";
   }
 
-  const trimmedAsset = assetIdText?.trim() ?? "";
-  if (trimmedAsset) parts.push(trimmedAsset);
-
-  const trimmedAddress = address?.trim() ?? "";
-  if (trimmedAddress) parts.push(trimmedAddress);
-
-  if (parts.length === 0) {
-    // Defensive: should never happen because callers guard, but if all
-    // three inputs are empty fall back to a sentinel rather than ""
-    // (monday rejects empty item names).
-    return "(unnamed)";
+  if (sorNames.length > 1) {
+    return `${sorNames.join(" + ")} - ${asset}`;
   }
 
-  return parts.join(" - ");
+  const sorName = sorNames[0];
+  const qty = input.designQty ?? null;
+  if (qty != null && qty > 1) {
+    const uomShort = shortUom(input.uom);
+    return `${qty}${uomShort} - ${sorName} - ${asset}`;
+  }
+  return `${sorName} - ${asset}`;
 }
