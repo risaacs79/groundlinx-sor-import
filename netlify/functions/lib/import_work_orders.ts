@@ -160,6 +160,10 @@ interface AssetGroup {
   address: string | null;
   /** Derived Job Type label from SOR composition. null if no recognised SORs. */
   jobType: string | null;
+  /** First-SOR Design Qty (only meaningful for single-SOR assets). */
+  primaryDesignQty: number | null;
+  /** First-SOR UOM string (only meaningful for single-SOR assets). */
+  primaryUom: string | null;
 }
 
 interface PlannedItem {
@@ -378,6 +382,7 @@ async function readExtract(
 interface RateCardEntry {
   name: string;
   category: string | null;
+  uom: string | null;
 }
 async function fetchRateCard(): Promise<Map<string, RateCardEntry>> {
   const data = await monday<{
@@ -396,7 +401,7 @@ async function fetchRateCard(): Promise<Map<string, RateCardEntry>> {
         items_page(limit: 500) {
           items {
             id name
-            column_values(ids: ["${RATE_CARD_COL.SOR_CODE}", "color_mm2twxv0"]) { id text }
+            column_values(ids: ["${RATE_CARD_COL.SOR_CODE}", "color_mm2twxv0", "text_mm2t76yv"]) { id text }
           }
         }
       }
@@ -412,6 +417,7 @@ async function fetchRateCard(): Promise<Map<string, RateCardEntry>> {
       map.set(sorCode.trim().toUpperCase(), {
         name: item.name.trim(),
         category: cv["color_mm2twxv0"]?.trim() || null,
+        uom: cv["text_mm2t76yv"]?.trim() || null,
       });
     }
   }
@@ -642,6 +648,8 @@ function aggregateAsset(
     ada,
     address,
     jobType: deriveJobType(sorKinds),
+    primaryDesignQty: rows[0]?.designQty ?? null,
+    primaryUom: rateCard.get(rows[0]?.sor.trim().toUpperCase() ?? "")?.uom ?? null,
   };
 }
 
@@ -666,7 +674,13 @@ function planAssets(
     const isPendingCons = a.aggregatedStatus === "Pending Construction";
     const needsNetworkAsset = isPendingCons && !networkAssetId;
 
-    const name = buildJobName(a.itemNames, a.assetId, null);
+    const name = buildJobName({
+      sorItemNames: a.itemNames,
+      assetIdText: a.assetId,
+      designQty: a.primaryDesignQty,
+      uom: a.primaryUom,
+      jobType: a.jobType,
+    });
 
     let skipReason: string | null = null;
     if (existingSet.has(a.assetId)) {
