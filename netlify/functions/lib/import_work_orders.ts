@@ -427,7 +427,10 @@ async function fetchRateCard(): Promise<Map<string, RateCardEntry>> {
 // ---------- Job Type derivation (mirrors main repo) ----------
 function categorizeSor(sorCode: string, category: string | null): string {
   const code = sorCode.trim().toUpperCase();
-  if (code === "CW-02-01-08") return "lid";
+  // Explicit per-code lid overrides (regardless of Category).
+  if (code === "CW-02-01-08") return "lid"; // Composite Pit Lids
+  if (code === "CW-02-01-06") return "lid"; // Pit lids
+  if (code.startsWith("CW-02-05-")) return "lid"; // Manhole lids + pit accessory work
   switch (category) {
     case "Pit Install":
       return "pit";
@@ -436,9 +439,15 @@ function categorizeSor(sorCode: string, category: string | null): string {
     case "Duct Install":
     case "Core Bore":
       return "duct";
-    default:
-      return "other";
   }
+  // Code-prefix fallback when Category is blank/null/unknown.
+  // Mirrors groundlinx-field-app/scripts/import_work_orders.ts.
+  if (code.startsWith("CW-02-03-") || code.startsWith("CW-02-04-")) return "acm";
+  if (code.startsWith("CW-02-")) return "pit";
+  if (code.startsWith("CW-01-")) return "duct";
+  if (code.startsWith("CW-03-")) return "duct";
+  if (code.startsWith("CW-05-")) return "duct";
+  return "other";
 }
 
 function deriveJobType(kinds: Set<string>): string | null {
