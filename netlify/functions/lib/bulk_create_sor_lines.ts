@@ -202,7 +202,40 @@ function cellDateIso(v: ExcelJS.CellValue): string | null {
   return null;
 }
 
-async function readExtract(source: string | Buffer): Promise<ExtractRow[]> {
+/**
+ * Header alias map — each canonical field accepts multiple header names so
+ * the script reads both:
+ *   - daily SOR Extract (sheet "Cons_Data", Title Case headers)
+ *   - K-2CSN-21 style work allocation files (sheet "Sheet1", snake_case headers)
+ */
+const HEADER_ALIASES: Record<string, string[]> = {
+  assetId: ["Asset ID", "id"],
+  sor: ["SOR", "item_code"],
+  sorDescription: ["SOR Description", "description"],
+  projectId: ["Project ID", "project_id"],
+  ada: ["ADA", "ada"],
+  designQty: ["Design Qty", "design_qty"],
+  actualQty: ["Actual Qty", "actual_qty"],
+  acceptedQty: ["accepted_qty", "Accepted Qty"],
+  consStatus: ["Cons Status", "sp_sor_status"],
+  sorStatus: ["SOR Status", "ugl_sor_status"],
+  invoiceNo: ["Invoice #", "invoice_id"],
+  constructionDate: ["construction_date", "Construction Date", "build_date_sor"],
+  reviewDate: ["review_date", "Review Date"],
+  comments: ["comments", "Comments", "VA Comments"],
+};
+
+const REQUIRED_FIELDS = ["assetId", "sor"] as const;
+
+interface ReadOptions {
+  /** Override sheet name. If unset, tries "Cons_Data" then "Sheet1". */
+  sheet?: string;
+}
+
+async function readExtract(
+  source: string | Buffer,
+  opts: ReadOptions = {}
+): Promise<ExtractRow[]> {
   const wb = new ExcelJS.Workbook();
   if (typeof source === "string") {
     await wb.xlsx.readFile(source);
@@ -215,57 +248,73 @@ async function readExtract(source: string | Buffer): Promise<ExtractRow[]> {
     ) as ArrayBuffer;
     await wb.xlsx.load(ab);
   }
-  const ws = wb.getWorksheet("Cons_Data");
-  if (!ws) throw new Error("Cons_Data sheet not found");
+
+  let ws: ExcelJS.Worksheet | undefined;
+  if (opts.sheet) {
+    ws = wb.getWorksheet(opts.sheet);
+    if (!ws) throw new Error(`Sheet "${opts.sheet}" not found`);
+  } else {
+    ws = wb.getWorksheet("Cons_Data") ?? wb.getWorksheet("Sheet1");
+    if (!ws) {
+      throw new Error(
+        `No "Cons_Data" or "Sheet1" sheet found — pass sheet override`
+      );
+    }
+  }
 
   const header: Record<string, number> = {};
   ws.getRow(1).eachCell((cell, col) => {
     const t = cellText(cell.value);
     if (t) header[t] = col;
   });
-  const required = [
-    "Asset ID",
-    "SOR",
-    "SOR Description",
-    "Project ID",
-    "ADA",
-    "Design Qty",
-    "Actual Qty",
-    "accepted_qty",
-    "Cons Status",
-    "SOR Status",
-    "Invoice #",
-    "construction_date",
-    "review_date",
-    "comments",
-  ];
-  for (const name of required) {
-    if (!header[name]) throw new Error(`Missing column "${name}" in Cons_Data`);
+
+  const colByField: Record<string, number | null> = {};
+  for (const [field, aliases] of Object.entries(HEADER_ALIASES)) {
+    let col: number | null = null;
+    for (const alias of aliases) {
+      if (header[alias]) {
+        col = header[alias];
+        break;
+      }
+    }
+    colByField[field] = col;
+  }
+
+  for (const field of REQUIRED_FIELDS) {
+    if (colByField[field] == null) {
+      const aliases = HEADER_ALIASES[field].join(" / ");
+      throw new Error(
+        `No column found for "${field}" — accepted aliases: ${aliases}. Sheet "${ws.name}" headers: ${Object.keys(header).slice(0, 25).join(", ")}${Object.keys(header).length > 25 ? ", ..." : ""}`
+      );
+    }
   }
 
   const rows: ExtractRow[] = [];
   for (let r = 2; r <= ws.rowCount; r++) {
     const row = ws.getRow(r);
-    const get = (name: string) => row.getCell(header[name]).value;
-    const assetId = cellText(get("Asset ID"));
-    const sor = cellText(get("SOR"));
+    const getCell = (field: string) => {
+      const col = colByField[field];
+      return col == null ? null : row.getCell(col).value;
+    };
+    const assetId = cellText(getCell("assetId"));
+    const sor = cellText(getCell("sor"));
     if (!assetId || !sor) continue;
     rows.push({
       rowIndex: r,
-      projectId: cellText(get("Project ID")),
-      ada: cellText(get("ADA")),
+      projectId: cellText(getCell("projectId")),
+      ada: cellText(getCell("ada")),
       assetId,
       sor,
-      sorDescription: cellText(get("SOR Description")),
-      designQty: cellNumber(get("Design Qty")),
-      actualQty: cellNumber(get("Actual Qty")),
-      acceptedQty: cellNumber(get("accepted_qty")),
-      consStatus: cellText(get("Cons Status")),
-      sorStatus: cellText(get("SOR Status")),
-      invoiceNo: cellText(get("Invoice #")),
-      constructionDate: cellDateIso(get("construction_date")),
-      reviewDate: cellDateIso(get("review_date")),
-      comments: cellText(get("comments")),
+      sorDescription: cellText(getCell("sorDescription")),
+      designQty: cellNumber(getCell("designQty")),
+      actualQty: cellNumber(getCell("actualQty")),
+      acceptedQty: cellNumber(getCell("acceptedQty")),
+      consStatus: cellText(getCell("consStatus")),
+      sorStatus: cellText(getCell("sorStatus")),
+      invoiceNo: cellText(getCell("invoiceNo")),
+      constructionDate: cellDateIso(getCell("constructionDate")),
+      reviewDate: cellDateIso(getCell("reviewDate")),
+      comments: cellText(getCell("comments")),
     });
   }
   return rows;
@@ -477,11 +526,17 @@ export interface BulkCreateResult {
   elapsedMs: number;
 }
 
+export interface RunBulkCreateOptions {
+  /** Override the sheet to read. Defaults: "Cons_Data" then "Sheet1". */
+  sheet?: string;
+}
+
 export async function runBulkCreateSorLines(
-  buffer: Buffer
+  buffer: Buffer,
+  opts: RunBulkCreateOptions = {}
 ): Promise<BulkCreateResult> {
   const start = Date.now();
-  const rows = await readExtract(buffer);
+  const rows = await readExtract(buffer, { sheet: opts.sheet });
   const rateCard = await fetchRateCard();
   const networkMap = await fetchNetworkAssetMap();
   const existingKeys = await fetchExistingSorLineKeys();
