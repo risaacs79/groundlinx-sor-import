@@ -45,6 +45,8 @@ const ACTIVE_COL = {
   RCTI: "text_mm2tdrdk",
   JOB_STATUS: "color_mm2tff18",
   UGL_PAYMENT_STATUS: "color_mm32x3ga",
+  PROJECT: "board_relation_mm2tzeaj", // → Projects board (5028084549)
+  LOCATION: "location_mm2tm61g",
   PRIMARY_ASSET: "board_relation_mm2tyedq",
   JOB_START_DATE: "date_mm2t1bck",
   DATE_SUBMITTED: "date_mm2tm5wk",
@@ -60,12 +62,19 @@ const APPROVED_COL = {
   RCTI: "text_mm32c4fj",
   JOB_STATUS: "color_mm329x8a",
   UGL_PAYMENT_STATUS: "color_mm322s90",
+  PROJECT: "board_relation_mm32fmsp", // → Projects board (5028084549)
+  LOCATION: "location_mm32tb6n",
   PRIMARY_ASSET: "board_relation_mm32kh12",
   JOB_START_DATE: "date_mm32d4s9",
   DATE_SUBMITTED: "date_mm32cc9k",
   DATE_APPROVED: "date_mm32p2b7",
   DATE_PAID: "date_mm32cjpd",
   QUICK_NOTE: "long_text_mm3277sp",
+};
+
+const PROJECTS_BOARD = 5028084549;
+const PROJECTS_COL = {
+  PROJECT_CODE: "text_mm2t1s7a",
 };
 
 // Network Assets columns
@@ -123,6 +132,7 @@ interface ExtractRow {
   constructionDate: string | null; // ISO YYYY-MM-DD
   reviewDate: string | null;
   comments: string | null;
+  address: string | null;
 }
 
 interface AssetGroup {
@@ -144,6 +154,8 @@ interface AssetGroup {
   /** First non-null Project ID / SAM / ADA from rows */
   projectId: string | null;
   ada: string | null;
+  /** First non-null address from rows (only present in work-allocation files) */
+  address: string | null;
 }
 
 interface PlannedItem {
@@ -261,6 +273,7 @@ const HEADER_ALIASES: Record<string, string[]> = {
   constructionDate: ["construction_date", "Construction Date", "build_date_sor"],
   reviewDate: ["review_date", "Review Date"],
   comments: ["comments", "Comments", "VA Comments"],
+  address: ["address", "Address"],
 };
 
 const REQUIRED_FIELDS = ["assetId", "sor"] as const;
@@ -351,6 +364,7 @@ async function readExtract(
       constructionDate: cellDateIso(getCell("constructionDate")),
       reviewDate: cellDateIso(getCell("reviewDate")),
       comments: cellText(getCell("comments")),
+      address: cellText(getCell("address")),
     });
   }
   return rows;
@@ -526,6 +540,7 @@ function aggregateAsset(
   let rctiNumber: string | null = null;
   let projectId: string | null = null;
   let ada: string | null = null;
+  let address: string | null = null;
 
   for (const r of rows) {
     if (!seenSor.has(r.sor)) {
@@ -551,6 +566,7 @@ function aggregateAsset(
     if (!rctiNumber && r.invoiceNo) rctiNumber = r.invoiceNo;
     if (!projectId && r.projectId) projectId = r.projectId;
     if (!ada && r.ada) ada = r.ada;
+    if (!address && r.address) address = r.address;
     if (r.comments && r.comments.trim()) {
       const tagged = `[${r.sor}] ${r.comments.trim()}`;
       if (!commentParts.includes(tagged)) commentParts.push(tagged);
@@ -576,6 +592,7 @@ function aggregateAsset(
     comments: commentParts.join("\n\n"),
     projectId,
     ada,
+    address,
   };
 }
 
@@ -627,6 +644,38 @@ interface ApplyResult {
   createdApproved: number;
   failed: number;
   failures: string[];
+}
+
+// ---------- Projects map ----------
+async function fetchProjectMap(): Promise<Map<string, string>> {
+  const data = await monday<{
+    boards: Array<{
+      items_page: {
+        items: Array<{
+          id: string;
+          column_values: Array<{ id: string; text: string | null }>;
+        }>;
+      };
+    }>;
+  }>(
+    `query ($boardId: ID!, $col: [String!]) {
+      boards(ids: [$boardId]) {
+        items_page(limit: 200) { items { id column_values(ids: $col) { id text } } }
+      }
+    }`,
+    {
+      boardId: String(PROJECTS_BOARD),
+      col: [PROJECTS_COL.PROJECT_CODE],
+    }
+  );
+  const map = new Map<string, string>();
+  for (const item of data.boards?.[0]?.items_page?.items ?? []) {
+    const code = item.column_values.find(
+      (c) => c.id === PROJECTS_COL.PROJECT_CODE
+    )?.text;
+    if (code) map.set(code.trim(), item.id);
+  }
+  return map;
 }
 
 // ---------- GL- Job Reference counter ----------
@@ -697,7 +746,8 @@ function formatGl(n: number): string {
 async function applyPlan(
   planned: PlannedItem[],
   dryRun: boolean,
-  startGlNumber: number
+  startGlNumber: number,
+  projectMap: Map<string, string>
 ): Promise<ApplyResult> {
   const result: ApplyResult = {
     createdNetworkAssets: 0,
@@ -823,6 +873,19 @@ async function applyPlan(
           }
         }
         if (a.comments) colVals[COL.QUICK_NOTE] = a.comments;
+        // Project relation — look up Projects board item id by full project code
+        if (a.projectId) {
+          const projectMondayId = projectMap.get(a.projectId.trim());
+          if (projectMondayId) {
+            colVals[COL.PROJECT] = {
+              item_ids: [parseInt(projectMondayId, 10)],
+            };
+          }
+        }
+        // Location — only present in work-allocation files (K-2CSN-21 etc.)
+        if (a.address) {
+          colVals[COL.LOCATION] = { address: a.address };
+        }
         if (target === "active" && p.networkAssetId) {
           colVals[COL.PRIMARY_ASSET] = {
             item_ids: [parseInt(p.networkAssetId, 10)],
@@ -890,11 +953,12 @@ export async function runImportWorkOrders(
   const start = Date.now();
   const extract = await readExtract(buffer, { sheet: opts.sheet });
   const rateCard = await fetchRateCard();
-  const [existingActive, existingApproved, networkAssets, maxGl] = await Promise.all([
+  const [existingActive, existingApproved, networkAssets, maxGl, projectMap] = await Promise.all([
     fetchExistingAssetIds(ACTIVE_JOBS_BOARD, ACTIVE_COL.ASSET_TEXT),
     fetchExistingAssetIds(APPROVED_JOBS_BOARD, APPROVED_COL.ASSET_TEXT),
     fetchNetworkAssetMap(),
     fetchMaxGlNumber(),
+    fetchProjectMap(),
   ]);
 
   const byAsset = new Map<string, ExtractRow[]>();
@@ -924,7 +988,7 @@ export async function runImportWorkOrders(
   }
 
   const skipped = planned.filter((p) => p.skipReason);
-  const result = await applyPlan(planned, false, maxGl);
+  const result = await applyPlan(planned, false, maxGl, projectMap);
 
   return {
     uniqueAssets: groups.length,
