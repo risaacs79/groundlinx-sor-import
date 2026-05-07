@@ -2,18 +2,18 @@
  * Build the canonical monday item-name for an Active Jobs / Approved & Paid
  * Jobs row.
  *
- * Three cases (Priority 5 hybrid pattern, May 2026):
+ * Three cases (Priority 5 Option Z, May 2026 — SOR-first, Asset ID last):
  *
  *   1. Single SOR, Design Qty > 1
- *        {qty}{UOM_short} - {Asset ID} - {SOR Friendly Name}
- *      e.g. "28m - 2URL-20-06-DCT-782 - DUCT - 50mm - Cat 1 - OTR"
+ *        {qty}{UOM_short} - {SOR Friendly Name} - {Asset ID}
+ *      e.g. "28m - DUCT - 50mm - Cat 1 - OTR - 2URL-20-06-DCT-782"
  *
  *   2. Single SOR, Design Qty <= 1 (qty prefix dropped — "1 pit" adds no info)
- *        {Asset ID} - {SOR Friendly Name}
+ *        {SOR Friendly Name} - {Asset ID}
  *
  *   3. Multi-SOR (2+ SORs on the same asset)
- *        {Job Type} - {Asset ID} - {SOR1} + {SOR2} [+ {SOR3} ...]
- *      e.g. "ACM Pit + New Pit - 000000003206182624 - Pit Riser + Install P5 Pit + Removal ACM P2"
+ *        {SOR1} + {SOR2} [+ {SOR3} ...] - {Asset ID}
+ *      e.g. "Install P5 Pit + Removal ACM P4/P5 - 000000003206233104"
  *
  * Mirror of scripts/lib/build_job_name.ts in the main field-app repo.
  */
@@ -23,7 +23,6 @@ export interface JobNameInput {
   assetIdText: string;
   designQty?: number | null;
   uom?: string | null;
-  jobType?: string | null;
 }
 
 function shortUom(uom: string | null | undefined): string {
@@ -47,15 +46,14 @@ export function buildJobName(input: JobNameInput): string {
   }
 
   if (sorNames.length > 1) {
-    const prefix = input.jobType?.trim() || "Combined";
-    return `${prefix} - ${asset} - ${sorNames.join(" + ")}`;
+    return `${sorNames.join(" + ")} - ${asset}`;
   }
 
   const sorName = sorNames[0];
   const qty = input.designQty ?? null;
   if (qty != null && qty > 1) {
     const uomShort = shortUom(input.uom);
-    return `${qty}${uomShort} - ${asset} - ${sorName}`;
+    return `${qty}${uomShort} - ${sorName} - ${asset}`;
   }
-  return `${asset} - ${sorName}`;
+  return `${sorName} - ${asset}`;
 }

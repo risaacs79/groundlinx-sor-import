@@ -679,7 +679,6 @@ function planAssets(
       assetIdText: a.assetId,
       designQty: a.primaryDesignQty,
       uom: a.primaryUom,
-      jobType: a.jobType,
     });
 
     let skipReason: string | null = null;
