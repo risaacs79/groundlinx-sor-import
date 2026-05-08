@@ -15,7 +15,11 @@
  *      - Generate runId (UUID)
  *  2. Create Sync Run audit item on monday with status=Running.
  *     Item exists within ~2s of the upload landing.
- *  3. Return 202 with {runId, monday_item_id, monday_item_url, board_url}.
+ *  3. Return 202 with no body. Netlify v2 background functions strip
+ *     response bodies — runId / monday_item_id can't reach the client
+ *     this way. They're logged server-side instead; the client links
+ *     to the Sync Runs board where the just-created item appears at
+ *     the top (sorted newest-first).
  *  4. Run runSyncSor → runImportWorkOrders sequentially. The 15-min
  *     background-function budget covers the worst case comfortably.
  *  5. On success: update Sync Run item with status=Success (or Partial
@@ -381,27 +385,19 @@ export default async (req: Request): Promise<Response> => {
   // exception never leaves the audit item stuck in Running.
   void runPipeline(pre.fileBuffer, pre.filename, runItem.id, runId, startedAt);
 
-  // Return 202 Accepted + the item URL. The browser shows a clickable
-  // link; user finds their just-started run on the Sync Runs board.
-  return new Response(
-    JSON.stringify({
-      ok: true,
-      runId,
-      monday_item_id: runItem.id,
-      monday_item_url: runItem.url,
-      board_url: `https://mv-civil-company.monday.com/boards/${SYNC_RUNS_BOARD}`,
-      status: "started",
-      filename: pre.filename,
-      rateLimitRemaining: pre.rateRemaining,
-    }),
-    {
-      status: 202,
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-store",
-      },
-    }
+  // Return 202 Accepted with no body. Netlify v2 background functions
+  // strip response bodies for bg-function invocations regardless of
+  // what we return — only the status is preserved. The runId and
+  // monday_item_id are logged server-side (Netlify function logs) for
+  // audit / triage; the user finds their just-started run by visiting
+  // the Sync Runs board (linked from the success card on the upload page).
+  console.log(
+    `[sync-bg] runId=${runId} mondayItemId=${runItem.id} filename="${pre.filename}" — pipeline started`
   );
+  return new Response(null, {
+    status: 202,
+    headers: { "Cache-Control": "no-store" },
+  });
 };
 
 async function runPipeline(

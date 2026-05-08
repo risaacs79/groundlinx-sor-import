@@ -13,8 +13,8 @@
         <h1 class="text-2xl font-bold tracking-tight">Groundlinx SOR Sync</h1>
         <p class="mt-1 text-sm text-zinc-400">
           Drop today&rsquo;s UGL SOR Extract <code>.xlsx</code> below.
-          The pipeline runs in the background (~2-3 min) and writes its
-          result to the
+          The pipeline runs in the background (~2-3 min). Click the
+          link that appears after starting to view sync status on the
           <a href="https://mv-civil-company.monday.com/boards/5028347145"
              target="_blank" rel="noopener"
              class="text-emerald-300 underline-offset-2 hover:underline">Sync
@@ -178,10 +178,16 @@
 
         let response;
         try {
-          // Track G1: background function. Returns 202 within ~2-3s with
-          // a link to the audit item; the actual sync_sor + import work
-          // continues server-side for up to 15 min and writes its result
-          // to the Sync Runs board on monday.
+          // Track G1: Netlify v2 background function. The 26-second sync
+          // ceiling is gone — the actual sync_sor + import work runs
+          // server-side for up to 15 min and writes its result to the
+          // Sync Runs board on monday.
+          //
+          // Important: Netlify v2 background functions emit 202 with an
+          // EMPTY body, regardless of what the function tries to return.
+          // Synchronous-prelude failures (auth, parse, rate-limit, monday
+          // create-item) DO surface as proper 4xx/5xx with JSON bodies.
+          // Only the 202 path is bodyless, so we branch on status here.
           response = await fetch("/api/sync-background", {
             method: "POST",
             headers: { Authorization: passwordInput.value },
@@ -193,19 +199,25 @@
           return;
         }
 
-        let body;
-        try {
-          body = await response.json();
-        } catch (err) {
-          showBanner("error", "Server returned non-JSON response (status " + response.status + ").");
+        // 202 Accepted — sync started. Body is empty (Netlify strips it
+        // for background-function invocations). Don't attempt to parse.
+        if (response.status === 202) {
+          addProgress("Sync started in background.", "ok");
+          renderStartedCard();
           finalize();
           return;
         }
 
-        // Synchronous-prelude failures (auth, parse, rate limit, monday
-        // create-item) surface here with the appropriate status code.
-        // Once the prelude passes, the function emits 202 and continues
-        // running in the background.
+        // Anything else has a JSON body with the error.
+        let body;
+        try {
+          body = await response.json();
+        } catch (err) {
+          showBanner("error", "Server returned status " + response.status + " with non-JSON body. Check Netlify function logs.");
+          finalize();
+          return;
+        }
+
         if (response.status === 401) {
           showBanner("error", "Wrong password. Check the value in your password manager.");
           finalize();
@@ -226,17 +238,7 @@
           finalize();
           return;
         }
-        if (response.status !== 202) {
-          showBanner("error", "Unexpected status " + response.status);
-          finalize();
-          return;
-        }
-
-        // 202 Accepted — sync started. The background function is
-        // running runSyncSor → runImportWorkOrders for up to 15 min.
-        // Result lands on the Sync Runs board on monday.
-        addProgress("Sync started in background.", "ok");
-        renderStartedCard(body);
+        showBanner("error", "Unexpected status " + response.status);
         finalize();
       });
 
@@ -268,16 +270,16 @@
         banner.textContent = "";
       }
 
-      function renderStartedCard(body) {
-        // Track G1: background-function 202 response. The pipeline is
-        // running server-side; status surfaces on the Sync Runs board
-        // on monday once it completes (~2-3 min normally, up to 15 min).
-        const itemUrl = body.monday_item_url || body.board_url || "https://mv-civil-company.monday.com/boards/5028347145";
-        const boardUrl = body.board_url || "https://mv-civil-company.monday.com/boards/5028347145";
+      function renderStartedCard() {
+        // Track G1: background-function 202 response with empty body.
+        // We don't have the per-item runId / monday_item_id client-side
+        // (Netlify strips bg-function response bodies). User clicks
+        // through to the Sync Runs board and finds their just-started
+        // run at the top — sorted newest-first, 1 item per day.
+        const boardUrl = "https://mv-civil-company.monday.com/boards/5028347145";
         summaryCard.innerHTML = `
-          <div class="mb-3 flex items-baseline justify-between gap-2">
+          <div class="mb-3">
             <h3 class="text-base font-semibold text-emerald-200">Sync started</h3>
-            <span class="text-xs text-emerald-300/80">${escapeHtml(body.filename || "extract.xlsx")}</span>
           </div>
           <p class="text-sm text-emerald-100/90">
             The pipeline is running in the background and will write its
@@ -291,21 +293,9 @@
             feed has the detailed pipeline log.
           </p>
           <div class="mt-5 flex flex-wrap gap-2 text-sm">
-            <a href="${itemUrl}" target="_blank" rel="noopener"
-               class="rounded-md border border-emerald-700 bg-emerald-900/40 px-3 py-1.5 text-emerald-200 hover:bg-emerald-900/60">
-              Your Sync Run &rarr;
-            </a>
             <a href="${boardUrl}" target="_blank" rel="noopener"
-               class="rounded-md border border-emerald-700/60 bg-emerald-900/20 px-3 py-1.5 text-emerald-300 hover:bg-emerald-900/40">
-              Sync Runs board &rarr;
-            </a>
-            <a href="https://mv-civil-company.monday.com/boards/5028084872" target="_blank" rel="noopener"
-               class="rounded-md border border-zinc-700 bg-zinc-900/40 px-3 py-1.5 text-zinc-300 hover:bg-zinc-900/60">
-              Active Jobs &rarr;
-            </a>
-            <a href="https://mv-civil-company.monday.com/boards/5028088229" target="_blank" rel="noopener"
-               class="rounded-md border border-zinc-700 bg-zinc-900/40 px-3 py-1.5 text-zinc-300 hover:bg-zinc-900/60">
-              Approved &amp; Paid &rarr;
+               class="rounded-md border border-emerald-700 bg-emerald-900/40 px-3 py-1.5 text-emerald-200 hover:bg-emerald-900/60">
+              Open Sync Runs board on monday &rarr;
             </a>
           </div>
         `;
