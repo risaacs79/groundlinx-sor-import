@@ -33,6 +33,12 @@ import { buildJobName } from "./build_job_name";
 
 // ---------- Config ----------
 const ACTIVE_JOBS_BOARD = 5028084872;
+// Submitted Jobs (Track B, May 2026) — middle-stage board for items
+// sent to UGL. Same column IDs as Active because it was created via
+// duplicate_board_with_structure. Idempotency check (Track J1, May
+// 2026) walks this board too so we don't recreate items already moved
+// Active → Submitted by Track B's automation.
+const SUBMITTED_JOBS_BOARD = 5028331769;
 const APPROVED_JOBS_BOARD = 5028088229;
 const NETWORK_ASSETS_BOARD = 5028087505;
 const RATE_CARD_BOARD = 5028088248;
@@ -670,6 +676,7 @@ function routeAsset(asset: AssetGroup): "active" | "approved" {
 function planAssets(
   groups: AssetGroup[],
   existingActive: Set<string>,
+  existingSubmitted: Set<string>,
   existingApproved: Set<string>,
   networkAssetMap: Map<string, string>
 ): PlannedItem[] {
@@ -677,7 +684,6 @@ function planAssets(
   for (const a of groups) {
     const target = routeAsset(a);
     const targetBoard = target === "active" ? ACTIVE_JOBS_BOARD : APPROVED_JOBS_BOARD;
-    const existingSet = target === "active" ? existingActive : existingApproved;
 
     const networkAssetId = networkAssetMap.get(a.assetId) ?? null;
     const isPendingCons = a.aggregatedStatus === "Pending Construction";
@@ -690,9 +696,17 @@ function planAssets(
       uom: a.primaryUom,
     });
 
+    // Track J1: skip if asset already exists on ANY of the 3 job
+    // boards. Submitted Jobs is the gap that caused 25 duplicates on
+    // 2026-05-08 — items moved Active → Submitted in Phase Bh were
+    // invisible to dedupe.
     let skipReason: string | null = null;
-    if (existingSet.has(a.assetId)) {
-      skipReason = `already on ${target} board`;
+    if (existingActive.has(a.assetId)) {
+      skipReason = "already on Active Jobs board";
+    } else if (existingSubmitted.has(a.assetId)) {
+      skipReason = "already on Submitted Jobs board (Track B mid-stage)";
+    } else if (existingApproved.has(a.assetId)) {
+      skipReason = "already on Approved & Paid board";
     }
 
     planned.push({
@@ -1029,8 +1043,14 @@ export async function runImportWorkOrders(
   const start = Date.now();
   const extract = await readExtract(buffer, { sheet: opts.sheet });
   const rateCard = await fetchRateCard();
-  const [existingActive, existingApproved, networkAssets, maxGl, projectMap] = await Promise.all([
+  // Track J1 fix: walk Submitted Jobs too so we don't recreate items
+  // that have already moved Active → Submitted (Track B's mid-stage).
+  // The original check only walked Active + Approved, which left a
+  // dedupe gap for the 45 items moved to Submitted in Phase Bh.
+  // Submitted uses the same column IDs as Active (duplicate_board).
+  const [existingActive, existingSubmitted, existingApproved, networkAssets, maxGl, projectMap] = await Promise.all([
     fetchExistingAssetIds(ACTIVE_JOBS_BOARD, ACTIVE_COL.ASSET_TEXT),
+    fetchExistingAssetIds(SUBMITTED_JOBS_BOARD, ACTIVE_COL.ASSET_TEXT),
     fetchExistingAssetIds(APPROVED_JOBS_BOARD, APPROVED_COL.ASSET_TEXT),
     fetchNetworkAssetMap(),
     fetchMaxGlNumber(),
@@ -1049,6 +1069,7 @@ export async function runImportWorkOrders(
   const planned = planAssets(
     groups,
     existingActive,
+    existingSubmitted,
     existingApproved,
     networkAssets
   );
