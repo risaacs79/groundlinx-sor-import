@@ -926,11 +926,22 @@ async function applyPlan(
           glCounter += 1;
           colVals[ACTIVE_COL.JOB_REFERENCE] = formatGl(glCounter);
         }
-        // Default Job Status. Active Jobs → "Imported / New" (the existing
-        // default). Approved & Paid → mirror aggregated status when it matches
-        // a Job Status label there ("Approved" / "Paid"), else "Imported / New".
+        // Default Job Status. Track J3 (May 2026): items routed to Active
+        // with non-Pending-Construction UGL Payment Status (Pending
+        // Artefacts, In Review, Paid - Pending RCTI, Partial Paid,
+        // Overpaid, Disputed) get Job Status = "Submitted to UGL" so
+        // Track B's automation moves them straight to Submitted Jobs on
+        // creation. Pending Construction items stay on Active with
+        // "Imported / New" until field crew completes them. Approved &
+        // Paid → mirror aggregated status when it matches a Job Status
+        // label there ("Approved" / "Paid"), else "Imported / New".
         if (target === "active") {
-          colVals[COL.JOB_STATUS] = { label: "Imported / New" };
+          colVals[COL.JOB_STATUS] = {
+            label:
+              a.aggregatedStatus === "Pending Construction"
+                ? "Imported / New"
+                : "Submitted to UGL",
+          };
         } else if (a.aggregatedStatus === "Approved" || a.aggregatedStatus === "Paid") {
           colVals[COL.JOB_STATUS] = { label: a.aggregatedStatus };
         } else {
