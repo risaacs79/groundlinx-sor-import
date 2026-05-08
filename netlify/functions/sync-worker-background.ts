@@ -2,21 +2,28 @@
  * POST /.netlify/functions/sync-worker-background — heavy-lifting worker.
  *
  * Track G2 (May 2026): the actual sync_sor_extract + import_work_orders
- * pipeline run, invoked by the synchronous wrapper at /api/sync. Netlify
- * v2 background function — 15-min budget, 202 auto-emitted with empty
- * body (caller doesn't read the response, it's fire-and-forget).
+ * + sync_job_data pipeline run, invoked by the synchronous wrapper at
+ * /api/sync. Netlify v2 background function — 15-min budget, 202
+ * auto-emitted with empty body (caller doesn't read the response, it's
+ * fire-and-forget).
  *
  * Auth: rejects POSTs without the shared INTERNAL_SYNC_SECRET in the
- * body. Bg functions are reachable at their public URL and Netlify
- * doesn't gate them at the CDN, so the secret is the only thing
- * stopping a random POST from triggering arbitrary monday writes.
+ * x-internal-secret header. Bg functions are reachable at their public
+ * URL and Netlify doesn't gate them at the CDN, so the secret is the
+ * only thing stopping a random POST from triggering arbitrary monday
+ * writes.
  *
  * Workflow:
- *  1. Parse JSON body — {runId, mondayItemId, filename, fileBase64, secret}
- *  2. Validate secret. Mismatch → 401 + log + exit (Netlify forces 202
- *     to caller anyway, but we abort the function before doing work).
+ *  1. Parse JSON body — {runId, mondayItemId, filename, fileBase64}
+ *  2. Validate x-internal-secret header. Mismatch → 401 + log + exit
+ *     (Netlify forces 202 to caller anyway, but we abort the function
+ *     before doing work).
  *  3. Decode fileBase64 → Buffer.
- *  4. Run runSyncSor → runImportWorkOrders sequentially.
+ *  4. Run runSyncSor → runImportWorkOrders → runSyncJobData
+ *     sequentially. Track J2 (May 2026) added the 3rd stage so per-job
+ *     stored numerics + Primary Asset relations land on the same
+ *     upload as the import — previously the dashboard would lag until
+ *     the next manual sync_job_data CLI run.
  *  5. Update Sync Run item (mondayItemId) with final state — status,
  *     Finished At, Duration sec, all count columns, optional error msg.
  *  6. Post detailed pipeline log as a monday update on the same item.
@@ -29,6 +36,7 @@
 import type { Config } from "@netlify/functions";
 import { runSyncSor } from "./lib/sync_sor_extract";
 import { runImportWorkOrders } from "./lib/import_work_orders";
+import { runSyncJobData } from "./lib/sync_job_data";
 
 // ---- Sync Runs board (Track G1) ----
 const SYNC_RUNS_BOARD = 5028347145;
@@ -213,6 +221,7 @@ async function runPipeline(
 ): Promise<void> {
   let syncSummary: Awaited<ReturnType<typeof runSyncSor>> | null = null;
   let importSummary: Awaited<ReturnType<typeof runImportWorkOrders>> | null = null;
+  let jobDataSummary: Awaited<ReturnType<typeof runSyncJobData>> | null = null;
   let stage = "init";
 
   try {
@@ -230,10 +239,23 @@ async function runPipeline(
       `[sync-worker-bg] runId=${runId} stage=${stage} done active=${importSummary.createdActive} approved=${importSummary.createdApproved} skipped=${importSummary.skipped} failed=${importSummary.failed}`
     );
 
+    // Track J2: 3rd stage. Backfills per-job Primary Asset relations
+    // and 6 revenue stored numerics across all 3 job boards. Idempotent
+    // so this is safe to run on every upload — no-ops if nothing
+    // changed. Typical run ~3-4 minutes (within bg 15-min budget).
+    stage = "sync_job_data";
+    console.log(`[sync-worker-bg] runId=${runId} stage=${stage} starting`);
+    jobDataSummary = await runSyncJobData();
+    console.log(
+      `[sync-worker-bg] runId=${runId} stage=${stage} done writes=${jobDataSummary.totalWrites} failed=${jobDataSummary.totalFailed} elapsed=${Math.round(jobDataSummary.elapsedMs / 1000)}s`
+    );
+
     const finishedAt = new Date();
     const durationSec = Math.round((finishedAt.getTime() - startedAt.getTime()) / 1000);
     const failedCount =
-      (syncSummary?.failed ?? 0) + (importSummary?.failed ?? 0);
+      (syncSummary?.failed ?? 0) +
+      (importSummary?.failed ?? 0) +
+      (jobDataSummary?.totalFailed ?? 0);
     const status: "Success" | "Partial" =
       failedCount > 0 || (syncSummary?.unmatched ?? 0) > 0 ? "Partial" : "Success";
 
@@ -247,6 +269,23 @@ async function runPipeline(
       failedCount,
       errorMessage: "",
     });
+
+    const jdReport = (
+      label: string,
+      r: Awaited<ReturnType<typeof runSyncJobData>>["active"]
+    ): string[] => [
+      `  ${label} (${r.total}):`,
+      `    primary writes: ${r.primaryWrites}`,
+      `    revenue writes: ${r.revenueWrites}`,
+      `    photo writes:   ${r.photoWrites}`,
+      `    unchanged:      ${r.unchanged}`,
+      `    TEST items:     ${r.testItems}`,
+      `    unmatched:      ${r.unmatchedItems}`,
+      `    failed:         ${r.failed}`,
+      ...(r.failures.length > 0
+        ? r.failures.slice(0, 5).map((f) => `      - ${f.slice(0, 250)}`)
+        : []),
+    ];
 
     const logLines: string[] = [
       `runId: ${runId}`,
@@ -285,6 +324,14 @@ async function runPipeline(
             ...importSummary.failures.slice(0, 10).map((f) => `    - ${f.slice(0, 250)}`),
           ]
         : []),
+      "",
+      "[runSyncJobData]",
+      `  total writes: ${jobDataSummary.totalWrites}`,
+      `  total failed: ${jobDataSummary.totalFailed}`,
+      `  elapsed: ${Math.round(jobDataSummary.elapsedMs / 1000)}s`,
+      ...jdReport("Active Jobs", jobDataSummary.active),
+      ...jdReport("Submitted Jobs", jobDataSummary.submitted),
+      ...jdReport("Approved & Paid", jobDataSummary.approved),
     ];
     await postSyncRunUpdate(itemId, logLines.join("\n"));
     console.log(
@@ -352,6 +399,14 @@ async function runPipeline(
                 `  created Approved: ${importSummary.createdApproved}`,
               ]
             : ["[runImportWorkOrders]", "  did not run"]),
+          "",
+          ...(jobDataSummary
+            ? [
+                "[runSyncJobData partial]",
+                `  total writes: ${jobDataSummary.totalWrites}`,
+                `  total failed: ${jobDataSummary.totalFailed}`,
+              ]
+            : ["[runSyncJobData]", "  did not run"]),
         ].join("\n")
       );
     } catch (innerErr) {
