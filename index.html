@@ -13,8 +13,12 @@
         <h1 class="text-2xl font-bold tracking-tight">Groundlinx SOR Sync</h1>
         <p class="mt-1 text-sm text-zinc-400">
           Drop today&rsquo;s UGL SOR Extract <code>.xlsx</code> below.
-          The script syncs status / RCTI / dates onto SOR Lines and
-          imports any new work orders into Active Jobs &amp; Approved boards.
+          The pipeline runs in the background (~2-3 min) and writes its
+          result to the
+          <a href="https://mv-civil-company.monday.com/boards/5028347145"
+             target="_blank" rel="noopener"
+             class="text-emerald-300 underline-offset-2 hover:underline">Sync
+          Runs board</a> on monday.
         </p>
       </header>
 
@@ -88,7 +92,7 @@
       </section>
 
       <footer class="mt-10 text-xs text-zinc-600">
-        <p>Server runs <code>sync_sor</code> &rarr; <code>import_work_orders</code> in sequence. Idempotent — re-running the same file is safe.</p>
+        <p>Server runs <code>sync_sor</code> &rarr; <code>import_work_orders</code> in sequence as a Netlify background function (15-min budget). Idempotent — re-running the same file is safe.</p>
       </footer>
     </main>
 
@@ -165,18 +169,20 @@
         progressSection.classList.remove("hidden");
         progressList.innerHTML = "";
 
-        const startedAt = Date.now();
         addProgress("Reading file…");
         addProgress(`File: <code>${selectedFile.name}</code> (${(selectedFile.size / 1024).toFixed(0)} KB)`);
-        addProgress("Posting to /api/sync…");
-        addProgress("Server is running sync_sor and import_work_orders. This can take 2–3 minutes on a first run.", "muted");
+        addProgress("Posting to /api/sync-background…");
 
         const formData = new FormData();
         formData.append("file", selectedFile);
 
         let response;
         try {
-          response = await fetch("/api/sync", {
+          // Track G1: background function. Returns 202 within ~2-3s with
+          // a link to the audit item; the actual sync_sor + import work
+          // continues server-side for up to 15 min and writes its result
+          // to the Sync Runs board on monday.
+          response = await fetch("/api/sync-background", {
             method: "POST",
             headers: { Authorization: passwordInput.value },
             body: formData,
@@ -196,6 +202,10 @@
           return;
         }
 
+        // Synchronous-prelude failures (auth, parse, rate limit, monday
+        // create-item) surface here with the appropriate status code.
+        // Once the prelude passes, the function emits 202 and continues
+        // running in the background.
         if (response.status === 401) {
           showBanner("error", "Wrong password. Check the value in your password manager.");
           finalize();
@@ -212,21 +222,21 @@
           return;
         }
         if (response.status === 500) {
-          showBanner("error", "Pipeline error: " + (body.error || "unknown"));
-          if (body.stage) addProgress(body.stage, "muted");
+          showBanner("error", "Server error: " + (body.error || "unknown"));
           finalize();
           return;
         }
-        if (!response.ok) {
+        if (response.status !== 202) {
           showBanner("error", "Unexpected status " + response.status);
           finalize();
           return;
         }
 
-        // 200 OK
-        const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
-        addProgress(`Done in ${elapsedSec}s.`, "ok");
-        renderSummary(body);
+        // 202 Accepted — sync started. The background function is
+        // running runSyncSor → runImportWorkOrders for up to 15 min.
+        // Result lands on the Sync Runs board on monday.
+        addProgress("Sync started in background.", "ok");
+        renderStartedCard(body);
         finalize();
       });
 
@@ -258,44 +268,43 @@
         banner.textContent = "";
       }
 
-      function renderSummary(body) {
-        const s = body.syncResults || {};
-        const i = body.importResults || {};
-        const seconds = ((body.totalRuntimeMs || 0) / 1000).toFixed(1);
+      function renderStartedCard(body) {
+        // Track G1: background-function 202 response. The pipeline is
+        // running server-side; status surfaces on the Sync Runs board
+        // on monday once it completes (~2-3 min normally, up to 15 min).
+        const itemUrl = body.monday_item_url || body.board_url || "https://mv-civil-company.monday.com/boards/5028347145";
+        const boardUrl = body.board_url || "https://mv-civil-company.monday.com/boards/5028347145";
         summaryCard.innerHTML = `
-          <div class="mb-4 flex items-baseline justify-between gap-2">
-            <h3 class="text-base font-semibold text-emerald-200">${escapeHtml(body.filename || "extract.xlsx")}</h3>
-            <span class="text-xs text-emerald-300/80">${seconds}s · ${body.fileSizeKB || "?"} KB</span>
+          <div class="mb-3 flex items-baseline justify-between gap-2">
+            <h3 class="text-base font-semibold text-emerald-200">Sync started</h3>
+            <span class="text-xs text-emerald-300/80">${escapeHtml(body.filename || "extract.xlsx")}</span>
           </div>
-          <dl class="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
-            <dt class="text-zinc-400">SOR Lines updated</dt>
-            <dd class="text-right font-mono text-zinc-100">${s.updated ?? "?"}</dd>
-            <dt class="text-zinc-400">unchanged</dt>
-            <dd class="text-right font-mono text-zinc-400">${s.unchanged ?? "?"}</dd>
-            <dt class="text-zinc-400">unmatched</dt>
-            <dd class="text-right font-mono text-zinc-400">${s.unmatched ?? "?"}</dd>
-            <dt class="text-zinc-400 mt-2">Created on Active Jobs</dt>
-            <dd class="text-right font-mono text-zinc-100 mt-2">${i.createdActive ?? "?"}</dd>
-            <dt class="text-zinc-400">Created on Approved &amp; Paid</dt>
-            <dd class="text-right font-mono text-zinc-100">${i.createdApproved ?? "?"}</dd>
-            <dt class="text-zinc-400">Network Assets created</dt>
-            <dd class="text-right font-mono text-zinc-100">${i.networkAssetsCreated ?? "?"}</dd>
-            <dt class="text-zinc-400">skipped (already imported)</dt>
-            <dd class="text-right font-mono text-zinc-400">${i.skipped ?? "?"}</dd>
-          </dl>
-          ${(s.newPaid?.length || s.newFieldComplete?.length) ? `
-            <div class="mt-4 grid grid-cols-2 gap-3 text-xs">
-              ${s.newFieldComplete?.length ? `<div><div class="text-zinc-400">New "Field Complete"</div><div class="font-mono text-emerald-200">+${s.newFieldComplete.length}</div></div>` : ""}
-              ${s.newPaid?.length ? `<div><div class="text-zinc-400">New "Paid"</div><div class="font-mono text-emerald-200">+${s.newPaid.length}</div></div>` : ""}
-            </div>
-          ` : ""}
-          <div class="mt-5 flex gap-3 text-sm">
-            <a href="https://mv-civil-company.monday.com/boards/5028084872" target="_blank" rel="noopener"
+          <p class="text-sm text-emerald-100/90">
+            The pipeline is running in the background and will write its
+            result to the <strong>Sync Runs</strong> board on monday in
+            ~2-3 minutes (up to 15 if it's a heavy day).
+          </p>
+          <p class="mt-2 text-xs text-emerald-300/70">
+            Look for the most recent item — status will move from
+            <code>Running</code> &rarr; <code>Success</code> /
+            <code>Partial</code> / <code>Failed</code>. The item's update
+            feed has the detailed pipeline log.
+          </p>
+          <div class="mt-5 flex flex-wrap gap-2 text-sm">
+            <a href="${itemUrl}" target="_blank" rel="noopener"
                class="rounded-md border border-emerald-700 bg-emerald-900/40 px-3 py-1.5 text-emerald-200 hover:bg-emerald-900/60">
+              Your Sync Run &rarr;
+            </a>
+            <a href="${boardUrl}" target="_blank" rel="noopener"
+               class="rounded-md border border-emerald-700/60 bg-emerald-900/20 px-3 py-1.5 text-emerald-300 hover:bg-emerald-900/40">
+              Sync Runs board &rarr;
+            </a>
+            <a href="https://mv-civil-company.monday.com/boards/5028084872" target="_blank" rel="noopener"
+               class="rounded-md border border-zinc-700 bg-zinc-900/40 px-3 py-1.5 text-zinc-300 hover:bg-zinc-900/60">
               Active Jobs &rarr;
             </a>
             <a href="https://mv-civil-company.monday.com/boards/5028088229" target="_blank" rel="noopener"
-               class="rounded-md border border-emerald-700 bg-emerald-900/40 px-3 py-1.5 text-emerald-200 hover:bg-emerald-900/60">
+               class="rounded-md border border-zinc-700 bg-zinc-900/40 px-3 py-1.5 text-zinc-300 hover:bg-zinc-900/60">
               Approved &amp; Paid &rarr;
             </a>
           </div>
