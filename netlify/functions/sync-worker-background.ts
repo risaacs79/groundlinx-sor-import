@@ -134,7 +134,6 @@ interface WorkerPayload {
   mondayItemId?: string;
   filename?: string;
   fileBase64?: string;
-  secret?: string;
 }
 
 export default async (req: Request): Promise<Response> => {
@@ -142,8 +141,28 @@ export default async (req: Request): Promise<Response> => {
   // is fire-and-forget so it doesn't read the response. We still
   // return early on 401 to short-circuit the function before any work
   // fires, which is the actual security mechanism here.
+  console.log(
+    `[sync-worker-bg] invoked: method=${req.method} url=${req.url}`
+  );
+
   if (req.method !== "POST") {
+    console.warn(`[sync-worker-bg] rejected: non-POST method ${req.method}`);
     return new Response(null, { status: 405 });
+  }
+
+  // Secret moved to x-internal-secret header (G2-fix1). Header is the
+  // cleaner place for an auth credential — the body stays pure data.
+  const expected = process.env.INTERNAL_SYNC_SECRET;
+  if (!expected) {
+    console.error("[sync-worker-bg] INTERNAL_SYNC_SECRET env var not set");
+    return new Response(null, { status: 500 });
+  }
+  const provided = req.headers.get("x-internal-secret");
+  if (provided !== expected) {
+    console.warn(
+      `[sync-worker-bg] rejected POST: x-internal-secret mismatch (received ${provided ? "<value>" : "<missing>"})`
+    );
+    return new Response(null, { status: 401 });
   }
 
   let payload: WorkerPayload;
@@ -152,18 +171,6 @@ export default async (req: Request): Promise<Response> => {
   } catch (err) {
     console.error("[sync-worker-bg] invalid JSON body:", err);
     return new Response(null, { status: 400 });
-  }
-
-  const expected = process.env.INTERNAL_SYNC_SECRET;
-  if (!expected) {
-    console.error("[sync-worker-bg] INTERNAL_SYNC_SECRET env var not set");
-    return new Response(null, { status: 500 });
-  }
-  if (payload.secret !== expected) {
-    console.warn(
-      `[sync-worker-bg] rejected POST: secret mismatch (received ${payload.secret ? "<value>" : "<missing>"})`
-    );
-    return new Response(null, { status: 401 });
   }
 
   const { runId, mondayItemId, filename, fileBase64 } = payload;

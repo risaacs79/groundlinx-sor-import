@@ -161,15 +161,28 @@ async function createSyncRunItem(
 // ---- Background-worker invocation ----
 
 /**
- * Resolve the URL of the bg worker function. Netlify exposes every
- * function at /.netlify/functions/<name> regardless of the
- * config.path alias. We use the deploy URL from `process.env.URL`
- * (always set in Netlify production / preview) and fall back to the
- * incoming request's origin for local dev.
+ * Resolve the URL of the bg worker function. Netlify v2 background
+ * functions cannot be triggered by relative-path fetches from within
+ * the same project — Netlify drops them silently. We need a fully-
+ * qualified URL.
+ *
+ * Resolution order (G2-fix1 May 2026):
+ *   1. process.env.URL — Netlify provides this in production
+ *   2. process.env.DEPLOY_URL — branch / preview deploys
+ *   3. (last resort) the incoming request's origin
+ *
+ * If none of the above resolve, the function logs an error and bails
+ * so the wrapper returns 500 to the client rather than firing a fetch
+ * to undefined.
  */
-function workerUrl(req: Request): string {
-  const base = process.env.URL || new URL(req.url).origin;
-  return `${base}/.netlify/functions/sync-worker-background`;
+function resolveWorkerBase(req: Request): string | null {
+  if (process.env.URL) return process.env.URL;
+  if (process.env.DEPLOY_URL) return process.env.DEPLOY_URL;
+  try {
+    return new URL(req.url).origin;
+  } catch {
+    return null;
+  }
 }
 
 interface WorkerPayload {
@@ -177,7 +190,6 @@ interface WorkerPayload {
   mondayItemId: string;
   filename: string;
   fileBase64: string;
-  secret: string;
 }
 
 // ---- Main handler ----
@@ -282,33 +294,65 @@ export default async (req: Request): Promise<Response> => {
     });
   }
 
-  // Fire-and-forget POST to the bg worker. We don't await it —
-  // Netlify's bg-function 202 emission is fast (sub-second), but we
-  // don't want to block our 200 response on it. Crucially we don't
-  // even await the connection initiation; if the worker invocation
-  // ever fails we'd see it as a stuck-Running item on the audit
-  // board, which is more useful than blocking the user-facing flow.
+  // ---- Resolve worker URL (G2-fix1) ----
+  // Netlify v2 background functions cannot be triggered by relative-
+  // path fetches — Netlify drops them silently. Track G2's first
+  // deploy showed 0 worker invocations despite successful wrapper
+  // runs; root cause was the relative URL we were sending. Now we
+  // require a fully-qualified URL via process.env.URL or DEPLOY_URL.
+  console.log(
+    `[sync] runId=${runId} env URL=${process.env.URL ?? "(undef)"} DEPLOY_URL=${process.env.DEPLOY_URL ?? "(undef)"}`
+  );
+  const workerBase = resolveWorkerBase(req);
+  if (!workerBase) {
+    console.error(
+      `[sync] runId=${runId} couldn't resolve worker base URL — env URL/DEPLOY_URL undefined and req.url unparseable`
+    );
+    return jsonResponse(500, {
+      ok: false,
+      error:
+        "Server misconfigured: couldn't resolve worker URL (env URL / DEPLOY_URL missing).",
+      runId,
+    });
+  }
+  const workerUrlFinal = `${workerBase}/.netlify/functions/sync-worker-background`;
+
+  // Fire-and-forget POST to the bg worker. We don't await it — but we
+  // DO chain .then/.catch so the worker invocation status (or fetch
+  // failure) lands in Netlify function logs. The user-facing 200
+  // response is not blocked on this fetch resolving.
+  //
+  // Secret moved from JSON body to x-internal-secret header (G2-fix1).
+  // Header is the cleaner place for an auth-style credential and keeps
+  // the body purely data.
   const payload: WorkerPayload = {
     runId,
     mondayItemId: runItem.id,
     filename,
     fileBase64: fileBuffer.toString("base64"),
-    secret: internal,
   };
-  const workerUrlFinal = workerUrl(req);
   console.log(
     `[sync] runId=${runId} mondayItemId=${runItem.id} filename="${filename}" — invoking worker at ${workerUrlFinal}`
   );
-  void fetch(workerUrlFinal, {
+  fetch(workerUrlFinal, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-internal-secret": internal,
+    },
     body: JSON.stringify(payload),
-  }).catch((err) => {
-    console.error(
-      `[sync] runId=${runId} worker invocation fetch failed:`,
-      err
-    );
-  });
+  })
+    .then((r) =>
+      console.log(
+        `[sync] runId=${runId} worker trigger response: ${r.status} ${r.statusText}`
+      )
+    )
+    .catch((err) => {
+      console.error(
+        `[sync] runId=${runId} worker invocation fetch failed:`,
+        err
+      );
+    });
 
   // Return 200 with the full audit-item context so the client can
   // deep-link, render the filename badge, and stamp the runId.
