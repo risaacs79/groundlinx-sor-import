@@ -39,6 +39,12 @@ const ACTIVE_JOBS_BOARD = 5028084872;
 // 2026) walks this board too so we don't recreate items already moved
 // Active → Submitted by Track B's automation.
 const SUBMITTED_JOBS_BOARD = 5028331769;
+// Job Complete (Track K, May 2026) — staging board between Active and
+// Submitted in the 4-board flow. Same column IDs as Active (created via
+// duplicate_board_with_structure). The dedupe walk includes this board
+// so re-imports don't recreate items the field crew has already
+// completed.
+const JOB_COMPLETE_BOARD = 5028375392;
 const APPROVED_JOBS_BOARD = 5028088229;
 const NETWORK_ASSETS_BOARD = 5028087505;
 const RATE_CARD_BOARD = 5028088248;

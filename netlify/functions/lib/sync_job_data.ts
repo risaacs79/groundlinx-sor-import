@@ -41,6 +41,12 @@ import {
 
 const ACTIVE_JOBS_BOARD = 5028084872;
 const SUBMITTED_JOBS_BOARD = 5028331769;
+// Job Complete (Track K, May 2026) — staging board between Active and
+// Submitted in the 4-board flow. Same column IDs as Active (created via
+// duplicate_board_with_structure). Used by K3 to walk this board's
+// items in the 4-board sync — the Active board's per-job stored
+// numerics + Primary Asset relations apply equally here.
+const JOB_COMPLETE_BOARD = 5028375392;
 const APPROVED_JOBS_BOARD = 5028088229;
 const NETWORK_ASSETS_BOARD = 5028087505;
 const SOR_LINES_BOARD = 5028087610;
