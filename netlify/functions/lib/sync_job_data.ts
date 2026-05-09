@@ -61,33 +61,44 @@ interface JobBoardCols {
   inReview: string;
   pendingArtefacts: string;
   disputed: string;
-  // Photo-progress columns — Track E3, May 2026.
-  // Only present on Active + Submitted; null on Approved & Paid (terminal,
-  // no script writes there).
+  // Photo-progress columns — Track E3, May 2026; extended to Job Complete
+  // by Track K3, May 2026. Present on Active + Job Complete + Submitted;
+  // null on Approved & Paid (terminal, no script writes there).
   photosRequired: string | null;
   photosTaken: string | null;
 }
 
 /**
- * Column IDs for the 6 SOR-revenue numerics drift across all 3 boards
+ * Column IDs for the 6 SOR-revenue numerics drift across the boards
  * because they were created independently (Phase Ca) — even Submitted
  * Jobs got new IDs since these columns were added post-duplicate.
+ *
+ * Job Complete (Track K, May 2026) is the exception: it was duplicated
+ * AFTER Phase Ca's revenue + photo columns landed on Active, so its
+ * column IDs are byte-for-byte identical to Active.
  */
-const JOB_BOARDS: Record<"active" | "submitted" | "approved", { id: number; cols: JobBoardCols }> = {
+const ACTIVE_JOB_COL_IDS: JobBoardCols = {
+  asset: "text_mm2tmm57",
+  primary: "board_relation_mm2tyedq",
+  forecast: "numeric_mm341c4r",
+  approved: "numeric_mm349b99",
+  paid: "numeric_mm34bqam",
+  inReview: "numeric_mm34kr58",
+  pendingArtefacts: "numeric_mm34r8h5",
+  disputed: "numeric_mm346gsq",
+  photosRequired: "numeric_mm34xwc1",
+  photosTaken: "numeric_mm344bk5",
+};
+
+const JOB_BOARDS: Record<"active" | "jobComplete" | "submitted" | "approved", { id: number; cols: JobBoardCols }> = {
   active: {
     id: ACTIVE_JOBS_BOARD,
-    cols: {
-      asset: "text_mm2tmm57",
-      primary: "board_relation_mm2tyedq",
-      forecast: "numeric_mm341c4r",
-      approved: "numeric_mm349b99",
-      paid: "numeric_mm34bqam",
-      inReview: "numeric_mm34kr58",
-      pendingArtefacts: "numeric_mm34r8h5",
-      disputed: "numeric_mm346gsq",
-      photosRequired: "numeric_mm34xwc1",
-      photosTaken: "numeric_mm344bk5",
-    },
+    cols: ACTIVE_JOB_COL_IDS,
+  },
+  jobComplete: {
+    id: JOB_COMPLETE_BOARD,
+    // Track K1 verification confirmed 57/57 column IDs match Active.
+    cols: ACTIVE_JOB_COL_IDS,
   },
   submitted: {
     id: SUBMITTED_JOBS_BOARD,
@@ -552,7 +563,7 @@ function computePhotoProgress(
 }
 
 interface JobItem {
-  boardKey: "active" | "submitted" | "approved";
+  boardKey: "active" | "jobComplete" | "submitted" | "approved";
   boardId: number;
   cols: JobBoardCols;
   itemId: string;
@@ -560,18 +571,18 @@ interface JobItem {
   asset: string;
   currentPrimary: string[];
   currentRevenue: Revenue;
-  /** Current photo progress (only meaningful for active+submitted; null on approved). */
+  /** Current photo progress (only meaningful for active+jobComplete+submitted; null on approved). */
   currentPhotos: PhotoProgress | null;
   desiredPrimary: string | null;
   desiredRevenue: Revenue;
-  /** Desired photo progress for active+submitted; null on approved (no writes). */
+  /** Desired photo progress for active+jobComplete+submitted; null on approved (no writes). */
   desiredPhotos: PhotoProgress | null;
   isTest: boolean;
   unmatchedAsset: boolean;
 }
 
 async function fetchJobBoardItems(
-  boardKey: "active" | "submitted" | "approved"
+  boardKey: "active" | "jobComplete" | "submitted" | "approved"
 ): Promise<Array<Omit<JobItem, "desiredPrimary" | "desiredRevenue" | "desiredPhotos" | "isTest" | "unmatchedAsset">>> {
   const board = JOB_BOARDS[boardKey];
   const cols = [
@@ -834,20 +845,22 @@ async function applyForBoard(
 
 export interface SyncJobDataResult {
   active: ApplyResult;
+  jobComplete: ApplyResult;
   submitted: ApplyResult;
   approved: ApplyResult;
   /** Total elapsed wall time in milliseconds. */
   elapsedMs: number;
-  /** Total writes across all 3 boards (primary + revenue + photo). */
+  /** Total writes across all 4 boards (primary + revenue + photo). */
   totalWrites: number;
-  /** Total failures across all 3 boards. */
+  /** Total failures across all 4 boards. */
   totalFailed: number;
 }
 
 /**
- * Run the per-job data sync over Active + Submitted + Approved boards.
- * Always real (no dry-run path) — the worker invokes this after a
- * successful import. Idempotent: writes only what's changed.
+ * Run the per-job data sync over Active + Job Complete + Submitted +
+ * Approved boards. Always real (no dry-run path) — the worker invokes
+ * this after a successful import. Idempotent: writes only what's
+ * changed. Track K3 (May 2026): added Job Complete to the walk.
  */
 export async function runSyncJobData(): Promise<SyncJobDataResult> {
   const start = Date.now();
@@ -857,6 +870,7 @@ export async function runSyncJobData(): Promise<SyncJobDataResult> {
     networkIdx,
     photosByAssetItemId,
     activeRaw,
+    jobCompleteRaw,
     submittedRaw,
     approvedRaw,
   ] = await Promise.all([
@@ -865,12 +879,16 @@ export async function runSyncJobData(): Promise<SyncJobDataResult> {
     fetchNetworkAssetIndex(),
     fetchPhotosByAssetItemId(),
     fetchJobBoardItems("active"),
+    fetchJobBoardItems("jobComplete"),
     fetchJobBoardItems("submitted"),
     fetchJobBoardItems("approved"),
   ]);
   const network = networkIdx.byName;
 
   const activePlans = activeRaw.map((r) =>
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId)
+  );
+  const jobCompletePlans = jobCompleteRaw.map((r) =>
     buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId)
   );
   const submittedPlans = submittedRaw.map((r) =>
@@ -880,18 +898,22 @@ export async function runSyncJobData(): Promise<SyncJobDataResult> {
     buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId)
   );
 
+  // Sequential to keep monday rate-limit pressure bounded.
   const active = await applyForBoard(activePlans, false);
+  const jobComplete = await applyForBoard(jobCompletePlans, false);
   const submitted = await applyForBoard(submittedPlans, false);
   const approved = await applyForBoard(approvedPlans, false);
 
   const totalWrites =
     active.primaryWrites + active.revenueWrites + active.photoWrites +
+    jobComplete.primaryWrites + jobComplete.revenueWrites + jobComplete.photoWrites +
     submitted.primaryWrites + submitted.revenueWrites + submitted.photoWrites +
     approved.primaryWrites + approved.revenueWrites + approved.photoWrites;
-  const totalFailed = active.failed + submitted.failed + approved.failed;
+  const totalFailed = active.failed + jobComplete.failed + submitted.failed + approved.failed;
 
   return {
     active,
+    jobComplete,
     submitted,
     approved,
     elapsedMs: Date.now() - start,
