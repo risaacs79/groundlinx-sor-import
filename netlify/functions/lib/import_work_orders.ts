@@ -181,9 +181,13 @@ interface AssetGroup {
 interface PlannedItem {
   asset: AssetGroup;
   /** Which board the row goes on */
-  targetBoard: typeof ACTIVE_JOBS_BOARD | typeof APPROVED_JOBS_BOARD;
-  /** "active" or "approved" — for log readability */
-  targetName: "active" | "approved";
+  targetBoard:
+    | typeof ACTIVE_JOBS_BOARD
+    | typeof JOB_COMPLETE_BOARD
+    | typeof SUBMITTED_JOBS_BOARD
+    | typeof APPROVED_JOBS_BOARD;
+  /** Routing destination — for log readability and column-map lookup. */
+  targetName: "active" | "jobComplete" | "submitted" | "approved";
   /** Computed item name */
   name: string;
   /** Skip reason, when set the item is NOT applied */
@@ -675,13 +679,41 @@ function aggregateAsset(
 }
 
 // ---------- Routing & planning ----------
-function routeAsset(asset: AssetGroup): "active" | "approved" {
-  return TERMINAL_STATUSES.has(asset.aggregatedStatus) ? "approved" : "active";
+type TargetName = "active" | "jobComplete" | "submitted" | "approved";
+
+function routeAsset(asset: AssetGroup): TargetName {
+  // Approved/Paid/Descoped → Approved & Paid (terminal lifecycle board).
+  if (TERMINAL_STATUSES.has(asset.aggregatedStatus)) return "approved";
+  // Pending Construction → Active Jobs (field crew has work to do).
+  if (asset.aggregatedStatus === "Pending Construction") return "active";
+  // Track K4: items already mid-pipeline (non-PC UGL Payment Status)
+  // skip the Active waypoint and land directly on Submitted Jobs.
+  // Replaces the J3 pattern of creating on Active with Job Status =
+  // "Submitted to UGL" and waiting for Track B's automation. The
+  // jobComplete branch is reserved for future routing — UGL's Extract
+  // doesn't carry "Complete - Review Photos" so the import never lands
+  // there from Extract data; items reach Job Complete via the
+  // field-app's "Complete" tap (K2 automation #1).
+  return "submitted";
+}
+
+function targetBoardId(target: TargetName): number {
+  switch (target) {
+    case "active":
+      return ACTIVE_JOBS_BOARD;
+    case "jobComplete":
+      return JOB_COMPLETE_BOARD;
+    case "submitted":
+      return SUBMITTED_JOBS_BOARD;
+    case "approved":
+      return APPROVED_JOBS_BOARD;
+  }
 }
 
 function planAssets(
   groups: AssetGroup[],
   existingActive: Set<string>,
+  existingJobComplete: Set<string>,
   existingSubmitted: Set<string>,
   existingApproved: Set<string>,
   networkAssetMap: Map<string, string>
@@ -689,7 +721,7 @@ function planAssets(
   const planned: PlannedItem[] = [];
   for (const a of groups) {
     const target = routeAsset(a);
-    const targetBoard = target === "active" ? ACTIVE_JOBS_BOARD : APPROVED_JOBS_BOARD;
+    const targetBoard = targetBoardId(target);
 
     const networkAssetId = networkAssetMap.get(a.assetId) ?? null;
     const isPendingCons = a.aggregatedStatus === "Pending Construction";
@@ -702,13 +734,15 @@ function planAssets(
       uom: a.primaryUom,
     });
 
-    // Track J1: skip if asset already exists on ANY of the 3 job
-    // boards. Submitted Jobs is the gap that caused 25 duplicates on
-    // 2026-05-08 — items moved Active → Submitted in Phase Bh were
-    // invisible to dedupe.
+    // Track J1 + K3: skip if asset already exists on ANY of the 4 job
+    // boards. Submitted Jobs was the original J1 gap; K3 adds Job
+    // Complete so re-imports don't duplicate items the field crew has
+    // already completed.
     let skipReason: string | null = null;
     if (existingActive.has(a.assetId)) {
       skipReason = "already on Active Jobs board";
+    } else if (existingJobComplete.has(a.assetId)) {
+      skipReason = "already on Job Complete board (field crew finished)";
     } else if (existingSubmitted.has(a.assetId)) {
       skipReason = "already on Submitted Jobs board (Track B mid-stage)";
     } else if (existingApproved.has(a.assetId)) {
@@ -717,7 +751,7 @@ function planAssets(
 
     planned.push({
       asset: a,
-      targetBoard,
+      targetBoard: targetBoard as PlannedItem["targetBoard"],
       targetName: target,
       name,
       skipReason,
@@ -732,6 +766,8 @@ function planAssets(
 interface ApplyResult {
   createdNetworkAssets: number;
   createdActive: number;
+  createdJobComplete: number;
+  createdSubmitted: number;
   createdApproved: number;
   failed: number;
   failures: string[];
@@ -843,6 +879,8 @@ async function applyPlan(
   const result: ApplyResult = {
     createdNetworkAssets: 0,
     createdActive: 0,
+    createdJobComplete: 0,
+    createdSubmitted: 0,
     createdApproved: 0,
     failed: 0,
     failures: [],
@@ -852,6 +890,8 @@ async function applyPlan(
   if (dryRun) {
     result.createdNetworkAssets = toCreate.filter((p) => p.needsNetworkAsset).length;
     result.createdActive = toCreate.filter((p) => p.targetName === "active").length;
+    result.createdJobComplete = toCreate.filter((p) => p.targetName === "jobComplete").length;
+    result.createdSubmitted = toCreate.filter((p) => p.targetName === "submitted").length;
     result.createdApproved = toCreate.filter((p) => p.targetName === "approved").length;
     return result;
   }
@@ -911,12 +951,18 @@ async function applyPlan(
   let glCounter = startGlNumber;
 
   // Phase 2 — create job rows on the appropriate target board.
+  // Track K4 (May 2026): now iterates over 4 boards. Active + Job
+  // Complete + Submitted share the same column-id schema (ACTIVE_COL)
+  // because all three were created via duplicate_board_with_structure
+  // from the same Active root. Approved & Paid has its own column-id
+  // map (APPROVED_COL).
   // We use change_simple_column_value-style JSON for status by name and
   // dates. Primary Asset relation only set when networkAssetId is known.
-  for (const target of ["active", "approved"] as const) {
+  for (const target of ["active", "jobComplete", "submitted", "approved"] as const) {
     const items = toCreate.filter((p) => p.targetName === target);
-    const boardId = target === "active" ? ACTIVE_JOBS_BOARD : APPROVED_JOBS_BOARD;
-    const COL = target === "active" ? ACTIVE_COL : APPROVED_COL;
+    if (items.length === 0) continue;
+    const boardId = targetBoardId(target);
+    const COL = target === "approved" ? APPROVED_COL : ACTIVE_COL;
 
     for (let i = 0; i < items.length; i += BATCH_SIZE) {
       const batch = items.slice(i, i + BATCH_SIZE);
@@ -928,26 +974,33 @@ async function applyPlan(
           [COL.ASSET_TEXT]: a.assetId,
           [COL.UGL_PAYMENT_STATUS]: { label: a.aggregatedStatus },
         };
-        if (target === "active") {
+        // GL- counter — Active + Job Complete + Submitted all carry a
+        // Job Reference (GL-NNN) since they share the schema. Approved
+        // & Paid uses its own column id and isn't gated by the counter.
+        if (target !== "approved") {
           glCounter += 1;
           colVals[ACTIVE_COL.JOB_REFERENCE] = formatGl(glCounter);
         }
-        // Default Job Status. Track J3 (May 2026): items routed to Active
-        // with non-Pending-Construction UGL Payment Status (Pending
-        // Artefacts, In Review, Paid - Pending RCTI, Partial Paid,
-        // Overpaid, Disputed) get Job Status = "Submitted to UGL" so
-        // Track B's automation moves them straight to Submitted Jobs on
-        // creation. Pending Construction items stay on Active with
-        // "Imported / New" until field crew completes them. Approved &
-        // Paid → mirror aggregated status when it matches a Job Status
-        // label there ("Approved" / "Paid"), else "Imported / New".
+        // Default Job Status — Track K4 routing semantics:
+        //   - active   (Pending Construction)  → "Imported / New"
+        //   - jobComplete                       → "Complete - Review Photos"
+        //     (defensive — UGL Extract doesn't carry this signal, so this
+        //      branch only fires for items deliberately routed via
+        //      future logic. Field-app crew taps land items on Job
+        //      Complete via the K2 monday automation, not via import.)
+        //   - submitted (non-PC UGL status)    → "Submitted to UGL"
+        //     (Track J3 → K4: was previously routed to Active with this
+        //      Job Status so Track B's automation moved it; K4 now
+        //      creates directly on Submitted, skipping the waypoint.)
+        //   - approved (Approved/Paid/Descoped) → "Approved" / "Paid"
+        //      when label matches Job Status enum on that board, else
+        //      "Imported / New".
         if (target === "active") {
-          colVals[COL.JOB_STATUS] = {
-            label:
-              a.aggregatedStatus === "Pending Construction"
-                ? "Imported / New"
-                : "Submitted to UGL",
-          };
+          colVals[COL.JOB_STATUS] = { label: "Imported / New" };
+        } else if (target === "jobComplete") {
+          colVals[COL.JOB_STATUS] = { label: "Complete - Review Photos" };
+        } else if (target === "submitted") {
+          colVals[COL.JOB_STATUS] = { label: "Submitted to UGL" };
         } else if (a.aggregatedStatus === "Approved" || a.aggregatedStatus === "Paid") {
           colVals[COL.JOB_STATUS] = { label: a.aggregatedStatus };
         } else {
@@ -993,7 +1046,11 @@ async function applyPlan(
         if (a.jobType) {
           colVals[COL.JOB_TYPE] = { label: a.jobType };
         }
-        if (target === "active" && p.networkAssetId) {
+        // Primary Asset relation — set on the active-schema boards
+        // (Active / Job Complete / Submitted) when we know the Network
+        // Assets monday id. Approved & Paid uses its own column id;
+        // sync_job_data backfills the relation there post-creation.
+        if (target !== "approved" && p.networkAssetId) {
           colVals[COL.PRIMARY_ASSET] = {
             item_ids: [parseInt(p.networkAssetId, 10)],
           };
@@ -1016,6 +1073,8 @@ async function applyPlan(
       try {
         await monday(query, variables);
         if (target === "active") result.createdActive += batch.length;
+        else if (target === "jobComplete") result.createdJobComplete += batch.length;
+        else if (target === "submitted") result.createdSubmitted += batch.length;
         else result.createdApproved += batch.length;
       } catch (err) {
         result.failed += batch.length;
@@ -1029,16 +1088,34 @@ async function applyPlan(
 }
 
 // ---------- Library entry point ----------
+/**
+ * Per-aggregated-status breakdown of the import. Track K4 (May 2026)
+ * extends this from the earlier 2-route shape to all 4 destinations:
+ *   - active       — Pending Construction items (field crew has work).
+ *   - jobComplete  — reserved (UGL Extract doesn't carry the trigger).
+ *   - submitted    — non-PC UGL Status items (mid-pipeline).
+ *   - approved     — Approved/Paid/Descoped (terminal lifecycle).
+ *   - skip         — already on one of the 4 boards (idempotent skip).
+ */
+export interface StatusRouteCounts {
+  active: number;
+  jobComplete: number;
+  submitted: number;
+  approved: number;
+  skip: number;
+}
+
 export interface ImportResult {
   uniqueAssets: number;
   networkAssetsCreated: number;
   createdActive: number;
+  createdJobComplete: number;
+  createdSubmitted: number;
   createdApproved: number;
   skipped: number;
   failed: number;
   failures: string[];
-  /** Status -> { active, approved, skip } breakdown for the response card */
-  byStatus: Record<string, { active: number; approved: number; skip: number }>;
+  byStatus: Record<string, StatusRouteCounts>;
   elapsedMs: number;
 }
 
@@ -1060,13 +1137,21 @@ export async function runImportWorkOrders(
   const start = Date.now();
   const extract = await readExtract(buffer, { sheet: opts.sheet });
   const rateCard = await fetchRateCard();
-  // Track J1 fix: walk Submitted Jobs too so we don't recreate items
-  // that have already moved Active → Submitted (Track B's mid-stage).
-  // The original check only walked Active + Approved, which left a
-  // dedupe gap for the 45 items moved to Submitted in Phase Bh.
-  // Submitted uses the same column IDs as Active (duplicate_board).
-  const [existingActive, existingSubmitted, existingApproved, networkAssets, maxGl, projectMap] = await Promise.all([
+  // Track J1 + K3 fix: walk all 4 job boards so we don't recreate items
+  // already on Active, Job Complete, Submitted, or Approved. Active +
+  // Job Complete + Submitted share the ACTIVE_COL.ASSET_TEXT column id
+  // (all duplicated from Active); Approved uses APPROVED_COL.ASSET_TEXT.
+  const [
+    existingActive,
+    existingJobComplete,
+    existingSubmitted,
+    existingApproved,
+    networkAssets,
+    maxGl,
+    projectMap,
+  ] = await Promise.all([
     fetchExistingAssetIds(ACTIVE_JOBS_BOARD, ACTIVE_COL.ASSET_TEXT),
+    fetchExistingAssetIds(JOB_COMPLETE_BOARD, ACTIVE_COL.ASSET_TEXT),
     fetchExistingAssetIds(SUBMITTED_JOBS_BOARD, ACTIVE_COL.ASSET_TEXT),
     fetchExistingAssetIds(APPROVED_JOBS_BOARD, APPROVED_COL.ASSET_TEXT),
     fetchNetworkAssetMap(),
@@ -1086,18 +1171,18 @@ export async function runImportWorkOrders(
   const planned = planAssets(
     groups,
     existingActive,
+    existingJobComplete,
     existingSubmitted,
     existingApproved,
     networkAssets
   );
 
-  const byStatus: Record<string, { active: number; approved: number; skip: number }> = {};
+  const byStatus: Record<string, StatusRouteCounts> = {};
   for (const p of planned) {
     const k = p.asset.aggregatedStatus;
-    const cur = byStatus[k] ?? { active: 0, approved: 0, skip: 0 };
+    const cur = byStatus[k] ?? { active: 0, jobComplete: 0, submitted: 0, approved: 0, skip: 0 };
     if (p.skipReason) cur.skip++;
-    else if (p.targetName === "active") cur.active++;
-    else cur.approved++;
+    else cur[p.targetName]++;
     byStatus[k] = cur;
   }
 
@@ -1108,6 +1193,8 @@ export async function runImportWorkOrders(
     uniqueAssets: groups.length,
     networkAssetsCreated: result.createdNetworkAssets,
     createdActive: result.createdActive,
+    createdJobComplete: result.createdJobComplete,
+    createdSubmitted: result.createdSubmitted,
     createdApproved: result.createdApproved,
     skipped: skipped.length,
     failed: result.failed,
