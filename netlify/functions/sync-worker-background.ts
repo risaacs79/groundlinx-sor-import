@@ -236,7 +236,7 @@ async function runPipeline(
     console.log(`[sync-worker-bg] runId=${runId} stage=${stage} starting`);
     importSummary = await runImportWorkOrders(fileBuffer);
     console.log(
-      `[sync-worker-bg] runId=${runId} stage=${stage} done active=${importSummary.createdActive} approved=${importSummary.createdApproved} skipped=${importSummary.skipped} failed=${importSummary.failed}`
+      `[sync-worker-bg] runId=${runId} stage=${stage} done active=${importSummary.createdActive} jobComplete=${importSummary.createdJobComplete} submitted=${importSummary.createdSubmitted} approved=${importSummary.createdApproved} skipped=${importSummary.skipped} failed=${importSummary.failed}`
     );
 
     // Track J2: 3rd stage. Backfills per-job Primary Asset relations
@@ -315,6 +315,8 @@ async function runPipeline(
       `  unique assets: ${importSummary.uniqueAssets}`,
       `  network assets created: ${importSummary.networkAssetsCreated}`,
       `  created on Active Jobs: ${importSummary.createdActive}`,
+      `  created on Job Complete: ${importSummary.createdJobComplete}`,
+      `  created on Submitted Jobs: ${importSummary.createdSubmitted}`,
       `  created on Approved & Paid: ${importSummary.createdApproved}`,
       `  skipped (already imported): ${importSummary.skipped}`,
       `  failed: ${importSummary.failed}`,
@@ -330,6 +332,7 @@ async function runPipeline(
       `  total failed: ${jobDataSummary.totalFailed}`,
       `  elapsed: ${Math.round(jobDataSummary.elapsedMs / 1000)}s`,
       ...jdReport("Active Jobs", jobDataSummary.active),
+      ...jdReport("Job Complete", jobDataSummary.jobComplete),
       ...jdReport("Submitted Jobs", jobDataSummary.submitted),
       ...jdReport("Approved & Paid", jobDataSummary.approved),
     ];
@@ -396,6 +399,8 @@ async function runPipeline(
             ? [
                 "[runImportWorkOrders partial]",
                 `  created Active: ${importSummary.createdActive}`,
+                `  created Job Complete: ${importSummary.createdJobComplete}`,
+                `  created Submitted: ${importSummary.createdSubmitted}`,
                 `  created Approved: ${importSummary.createdApproved}`,
               ]
             : ["[runImportWorkOrders]", "  did not run"]),
