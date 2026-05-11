@@ -48,6 +48,13 @@ const SUBMITTED_JOBS_BOARD = 5028331769;
 // numerics + Primary Asset relations apply equally here.
 const JOB_COMPLETE_BOARD = 5028375392;
 const APPROVED_JOBS_BOARD = 5028088229;
+// Cancelled Jobs (Track G3-fix5, 11 May 2026) — destination for rows
+// whose UGL Payment Status is "Descoped". Duplicated from Active via
+// duplicate_board_with_structure, so column IDs are byte-identical to
+// Active; same JOB_BOARDS schema reuse pattern as Job Complete. Lives
+// in workspace 2977219 / folder 6615544 alongside Approved & Paid Jobs.
+// G3-fix5a: ID corrected from 5028417160 (wrong workspace) → 5028418115.
+const CANCELLED_JOBS_BOARD = 5028418115;
 const NETWORK_ASSETS_BOARD = 5028087505;
 const SOR_LINES_BOARD = 5028087610;
 const ASSET_PHOTOS_BOARD = 5028130740;
@@ -102,7 +109,10 @@ const ACTIVE_JOB_COL_IDS: JobBoardCols = {
   uglPaymentStatus: "color_mm32x3ga",
 };
 
-const JOB_BOARDS: Record<"active" | "jobComplete" | "submitted" | "approved", { id: number; cols: JobBoardCols }> = {
+const JOB_BOARDS: Record<
+  "active" | "jobComplete" | "submitted" | "approved" | "cancelled",
+  { id: number; cols: JobBoardCols }
+> = {
   active: {
     id: ACTIVE_JOBS_BOARD,
     cols: ACTIVE_JOB_COL_IDS,
@@ -110,6 +120,11 @@ const JOB_BOARDS: Record<"active" | "jobComplete" | "submitted" | "approved", { 
   jobComplete: {
     id: JOB_COMPLETE_BOARD,
     // Track K1 verification confirmed 57/57 column IDs match Active.
+    cols: ACTIVE_JOB_COL_IDS,
+  },
+  cancelled: {
+    id: CANCELLED_JOBS_BOARD,
+    // Duplicated from Active 11 May 2026 — column IDs byte-identical.
     cols: ACTIVE_JOB_COL_IDS,
   },
   submitted: {
@@ -737,7 +752,7 @@ function computePhotoProgress(
 }
 
 interface JobItem {
-  boardKey: "active" | "jobComplete" | "submitted" | "approved";
+  boardKey: "active" | "jobComplete" | "submitted" | "approved" | "cancelled";
   boardId: number;
   cols: JobBoardCols;
   itemId: string;
@@ -776,7 +791,7 @@ type JobItemRaw = Omit<
 >;
 
 async function fetchJobBoardItems(
-  boardKey: "active" | "jobComplete" | "submitted" | "approved"
+  boardKey: "active" | "jobComplete" | "submitted" | "approved" | "cancelled"
 ): Promise<JobItemRaw[]> {
   const board = JOB_BOARDS[boardKey];
   const cols = [
@@ -902,6 +917,16 @@ function buildPlan(
     desiredPhotos = computePhotoProgress(sorRows, photos);
   }
   const lifecycle = lifecycleByAsset.get(raw.asset) ?? EMPTY_LIFECYCLE;
+  // Track G3-fix5: transform UGL "Descoped" → our internal "Cancelled"
+  // at write time. The transform is applied here (not in
+  // fetchSorLifecycleByAsset) so the rollup source-of-truth stays
+  // aligned with SOR Lines' UGL Status; only the job-board displayed
+  // status is rebranded. Idempotent: rows already showing "Cancelled"
+  // get desired="Cancelled" → diff-check skips.
+  const desiredUglPaymentStatus =
+    lifecycle.aggregatedStatus === "Descoped"
+      ? "Cancelled"
+      : lifecycle.aggregatedStatus;
   return {
     ...raw,
     isTest,
@@ -910,7 +935,7 @@ function buildPlan(
     desiredRevenue,
     desiredPhotos,
     desiredRctiNumber: lifecycle.rctiNumber,
-    desiredUglPaymentStatus: lifecycle.aggregatedStatus,
+    desiredUglPaymentStatus,
   };
 }
 
@@ -1094,11 +1119,13 @@ export interface SyncJobDataResult {
   jobComplete: ApplyResult;
   submitted: ApplyResult;
   approved: ApplyResult;
+  /** Track G3-fix5: Cancelled Jobs board added 11 May 2026. */
+  cancelled: ApplyResult;
   /** Total elapsed wall time in milliseconds. */
   elapsedMs: number;
-  /** Total writes across all 4 boards (primary + revenue + photo). */
+  /** Total writes across all 5 boards (primary + revenue + photo + lifecycle). */
   totalWrites: number;
-  /** Total failures across all 4 boards. */
+  /** Total failures across all 5 boards. */
   totalFailed: number;
 }
 
@@ -1120,6 +1147,7 @@ export async function runSyncJobData(): Promise<SyncJobDataResult> {
     jobCompleteRaw,
     submittedRaw,
     approvedRaw,
+    cancelledRaw,
   ] = await Promise.all([
     fetchSorRevenueByAsset(),
     fetchSorMethodsByAsset(),
@@ -1130,6 +1158,7 @@ export async function runSyncJobData(): Promise<SyncJobDataResult> {
     fetchJobBoardItems("jobComplete"),
     fetchJobBoardItems("submitted"),
     fetchJobBoardItems("approved"),
+    fetchJobBoardItems("cancelled"),
   ]);
   const network = networkIdx.byName;
 
@@ -1145,25 +1174,32 @@ export async function runSyncJobData(): Promise<SyncJobDataResult> {
   const approvedPlans = approvedRaw.map((r) =>
     buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset)
   );
+  const cancelledPlans = cancelledRaw.map((r) =>
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset)
+  );
 
   // Sequential to keep monday rate-limit pressure bounded.
   const active = await applyForBoard(activePlans, false);
   const jobComplete = await applyForBoard(jobCompletePlans, false);
   const submitted = await applyForBoard(submittedPlans, false);
   const approved = await applyForBoard(approvedPlans, false);
+  const cancelled = await applyForBoard(cancelledPlans, false);
 
   const totalWrites =
     active.primaryWrites + active.revenueWrites + active.photoWrites + active.lifecycleWrites +
     jobComplete.primaryWrites + jobComplete.revenueWrites + jobComplete.photoWrites + jobComplete.lifecycleWrites +
     submitted.primaryWrites + submitted.revenueWrites + submitted.photoWrites + submitted.lifecycleWrites +
-    approved.primaryWrites + approved.revenueWrites + approved.photoWrites + approved.lifecycleWrites;
-  const totalFailed = active.failed + jobComplete.failed + submitted.failed + approved.failed;
+    approved.primaryWrites + approved.revenueWrites + approved.photoWrites + approved.lifecycleWrites +
+    cancelled.primaryWrites + cancelled.revenueWrites + cancelled.photoWrites + cancelled.lifecycleWrites;
+  const totalFailed =
+    active.failed + jobComplete.failed + submitted.failed + approved.failed + cancelled.failed;
 
   return {
     active,
     jobComplete,
     submitted,
     approved,
+    cancelled,
     elapsedMs: Date.now() - start,
     totalWrites,
     totalFailed,

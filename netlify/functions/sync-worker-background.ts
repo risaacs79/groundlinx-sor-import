@@ -37,6 +37,10 @@ import type { Config } from "@netlify/functions";
 import { runSyncSor } from "./lib/sync_sor_extract";
 import { runImportWorkOrders } from "./lib/import_work_orders";
 import { runSyncJobData } from "./lib/sync_job_data";
+import {
+  runReconcileRowPlacement,
+  type ReconcileResult,
+} from "./lib/reconcile_row_placement";
 
 // ---- Sync Runs board (Track G1) ----
 const SYNC_RUNS_BOARD = 5028347145;
@@ -333,6 +337,7 @@ async function runPipeline(
   let syncSummary: Awaited<ReturnType<typeof runSyncSor>> | null = null;
   let importSummary: Awaited<ReturnType<typeof runImportWorkOrders>> | null = null;
   let jobDataSummary: Awaited<ReturnType<typeof runSyncJobData>> | null = null;
+  let reconcileSummary: ReconcileResult | null = null;
   let stage = "init";
 
   try {
@@ -361,12 +366,63 @@ async function runPipeline(
       `[sync-worker-bg] runId=${runId} stage=${stage} done writes=${jobDataSummary.totalWrites} failed=${jobDataSummary.totalFailed} elapsed=${Math.round(jobDataSummary.elapsedMs / 1000)}s`
     );
 
+    // Stage 3 — reconcile row placement. Gated on ENABLE_STAGE_3 env
+    // var so production stays no-op until the one-time migration has
+    // run and Rowan flips the flag in Netlify. Idempotent / diff-only
+    // — rows already on the correct board are skipped, blanks +
+    // unknown statuses + TEST assets are skipped, so a stale ENABLE
+    // flag doesn't cause drift.
+    if (process.env.ENABLE_STAGE_3 === "true") {
+      stage = "reconcile_row_placement";
+      console.log(`[sync-worker-bg] runId=${runId} stage=${stage} starting`);
+      try {
+        reconcileSummary = await runReconcileRowPlacement({ dryRun: false });
+        console.log(
+          `[sync-worker-bg] runId=${runId} stage=${stage} done planned=${reconcileSummary.movesPlanned} succeeded=${reconcileSummary.movesSucceeded} failed=${reconcileSummary.movesFailed} unchanged=${reconcileSummary.unchanged}`
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[sync-worker-bg] runId=${runId} stage=${stage} threw:`,
+          msg
+        );
+        // Stage 3 failure doesn't fail the pipeline — log it and
+        // continue. The audit row will surface this in the failures
+        // section but final status stays Success/Partial based on the
+        // upstream stages.
+        reconcileSummary = {
+          totalChecked: 0,
+          movesPlanned: 0,
+          movesSucceeded: 0,
+          movesFailed: 1,
+          unchanged: 0,
+          skippedBlankStatus: 0,
+          skippedUnknownStatus: 0,
+          skippedTest: 0,
+          byDirection: {},
+          failures: [
+            {
+              itemId: "(stage)",
+              fromBoard: "active",
+              toBoard: "active",
+              error: `stage threw: ${msg.slice(0, 200)}`,
+            },
+          ],
+        };
+      }
+    } else {
+      console.log(
+        `[sync-worker-bg] runId=${runId} stage=reconcile_row_placement SKIPPED (ENABLE_STAGE_3 != "true")`
+      );
+    }
+
     const finishedAt = new Date();
     const durationSec = Math.round((finishedAt.getTime() - startedAt.getTime()) / 1000);
     const failedCount =
       (syncSummary?.failed ?? 0) +
       (importSummary?.failed ?? 0) +
-      (jobDataSummary?.totalFailed ?? 0);
+      (jobDataSummary?.totalFailed ?? 0) +
+      (reconcileSummary?.movesFailed ?? 0);
     const status: "Success" | "Partial" =
       failedCount > 0 || (syncSummary?.unmatched ?? 0) > 0 ? "Partial" : "Success";
 
@@ -447,6 +503,45 @@ async function runPipeline(
       ...jdReport("Job Complete", jobDataSummary.jobComplete),
       ...jdReport("Submitted Jobs", jobDataSummary.submitted),
       ...jdReport("Approved & Paid", jobDataSummary.approved),
+      ...jdReport("Cancelled Jobs", jobDataSummary.cancelled),
+      "",
+      "[runReconcileRowPlacement]",
+      ...(reconcileSummary
+        ? [
+            `  total rows checked: ${reconcileSummary.totalChecked}`,
+            `  moves planned:      ${reconcileSummary.movesPlanned}`,
+            `  moves succeeded:    ${reconcileSummary.movesSucceeded}`,
+            `  moves failed:       ${reconcileSummary.movesFailed}`,
+            `  unchanged:          ${reconcileSummary.unchanged}`,
+            `  skipped (blank):    ${reconcileSummary.skippedBlankStatus}`,
+            `  skipped (unknown):  ${reconcileSummary.skippedUnknownStatus}`,
+            `  skipped (TEST):     ${reconcileSummary.skippedTest}`,
+            "  by direction:",
+            ...Object.entries(reconcileSummary.byDirection)
+              .sort((a, b) => b[1] - a[1])
+              .map(([k, n]) => `    ${k}: ${n}`),
+            ...(reconcileSummary.unknownStatusSamples &&
+            reconcileSummary.unknownStatusSamples.length > 0
+              ? [
+                  "  unknown statuses (top 10):",
+                  ...reconcileSummary.unknownStatusSamples.map(
+                    (s) => `    ${s}`
+                  ),
+                ]
+              : []),
+            ...(reconcileSummary.failures.length > 0
+              ? [
+                  "  failures:",
+                  ...reconcileSummary.failures
+                    .slice(0, 10)
+                    .map(
+                      (f) =>
+                        `    - item=${f.itemId} ${f.fromBoard}→${f.toBoard}: ${f.error.slice(0, 200)}`
+                    ),
+                ]
+              : []),
+          ]
+        : ["  SKIPPED (ENABLE_STAGE_3 != 'true')"]),
     ];
     await postSyncRunUpdate(itemId, logLines.join("\n"));
     console.log(
