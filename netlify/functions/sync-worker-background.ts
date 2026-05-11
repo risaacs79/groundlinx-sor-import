@@ -503,6 +503,7 @@ async function runPipeline(
       ...jdReport("Job Complete", jobDataSummary.jobComplete),
       ...jdReport("Submitted Jobs", jobDataSummary.submitted),
       ...jdReport("Approved & Paid", jobDataSummary.approved),
+      ...jdReport("Cancelled Jobs", jobDataSummary.cancelled),
       "",
       "[runReconcileRowPlacement]",
       ...(reconcileSummary

@@ -46,24 +46,39 @@ const ACTIVE_JOBS_BOARD = 5028084872;
 const JOB_COMPLETE_BOARD = 5028375392;
 const SUBMITTED_JOBS_BOARD = 5028331769;
 const APPROVED_JOBS_BOARD = 5028088229;
+/** Track G3-fix5 (11 May 2026): new board for jobs UGL has descoped.
+ *  Duplicated from Active board (5028084872) via
+ *  duplicate_board_with_structure, so column IDs are byte-identical
+ *  to Active and the board is part of the active-schema cluster.
+ *  Workspace 2889787 ("One Board Main WorkSpace") per Rowan's brief —
+ *  note the other 4 boards live in workspace 2977219 ("Groundlinx HQ");
+ *  cross-workspace routing works fine but worth knowing for views. */
+const CANCELLED_JOBS_BOARD = 5028417160;
 
 /** "active-schema" boards share column IDs (created via
- *  duplicate_board_with_structure). Approved & Paid is the only board
- *  with a separate schema. Knowing this drives which moves need an
+ *  duplicate_board_with_structure from Active). Approved & Paid is
+ *  the only board with a separate schema. Drives which moves need an
  *  explicit columns_mapping in the move_item_to_board mutation. */
 const ACTIVE_SCHEMA_BOARDS = new Set<number>([
   ACTIVE_JOBS_BOARD,
   JOB_COMPLETE_BOARD,
   SUBMITTED_JOBS_BOARD,
+  CANCELLED_JOBS_BOARD,
 ]);
 
-export type BoardKey = "active" | "jobComplete" | "submitted" | "approved";
+export type BoardKey =
+  | "active"
+  | "jobComplete"
+  | "submitted"
+  | "approved"
+  | "cancelled";
 
 const BOARD_ID_OF: Record<BoardKey, number> = {
   active: ACTIVE_JOBS_BOARD,
   jobComplete: JOB_COMPLETE_BOARD,
   submitted: SUBMITTED_JOBS_BOARD,
   approved: APPROVED_JOBS_BOARD,
+  cancelled: CANCELLED_JOBS_BOARD,
 };
 
 const BOARD_KEY_OF: Record<number, BoardKey> = {
@@ -71,23 +86,27 @@ const BOARD_KEY_OF: Record<number, BoardKey> = {
   [JOB_COMPLETE_BOARD]: "jobComplete",
   [SUBMITTED_JOBS_BOARD]: "submitted",
   [APPROVED_JOBS_BOARD]: "approved",
+  [CANCELLED_JOBS_BOARD]: "cancelled",
 };
 
-/** Asset ID column ID per board. Active/JobComplete/Submitted share
- *  text_mm2tmm57; Approved has text_mm325kny. */
+/** Asset ID column ID per board. Active-schema cluster (Active /
+ *  JobComplete / Submitted / Cancelled) shares text_mm2tmm57; Approved
+ *  has text_mm325kny. */
 const ASSET_COL_OF: Record<BoardKey, string> = {
   active: "text_mm2tmm57",
   jobComplete: "text_mm2tmm57",
   submitted: "text_mm2tmm57",
+  cancelled: "text_mm2tmm57",
   approved: "text_mm325kny",
 };
 
-/** UGL Payment Status column ID per board. Active/JobComplete/Submitted
- *  share color_mm32x3ga; Approved has color_mm322s90. */
+/** UGL Payment Status column ID per board. Active-schema cluster
+ *  shares color_mm32x3ga; Approved has color_mm322s90. */
 const STATUS_COL_OF: Record<BoardKey, string> = {
   active: "color_mm32x3ga",
   jobComplete: "color_mm32x3ga",
   submitted: "color_mm32x3ga",
+  cancelled: "color_mm32x3ga",
   approved: "color_mm322s90",
 };
 
@@ -119,10 +138,27 @@ const STATUS_TO_BOARD_KEY = new Map<string, BoardKey>([
   // Active-lifecycle statuses → Active
   ["Pending Construction", "active"],
   ["Not Started", "active"],
-  // Anomalies — keep on Active where they're visible for re-work
+  // Disputed → Active (gets reworked, stays in lifecycle view)
   ["Disputed", "active"],
-  ["Descoped", "active"],
+  // Descoped → Cancelled (Track G3-fix5). UGL "Descoped" maps to our
+  // internal "Cancelled" status; sync_job_data also transforms the
+  // status text on write. Both labels route to the same board so a
+  // row mid-transform still ends up at the right destination.
+  ["Descoped", "cancelled"],
+  ["Cancelled", "cancelled"],
 ]);
+
+/** Status text transform applied at write time. UGL emits "Descoped";
+ *  we display + store "Cancelled". Applied by:
+ *    - reconcile_row_placement.executeOneMove (post-move status write
+ *      when destination is the Cancelled board)
+ *    - sync_job_data.runSyncJobData (lifecycle write path; transforms
+ *      the desired status BEFORE the diff-and-write check, so already-
+ *      "Cancelled" rows don't keep flipping back to "Descoped"). */
+export function transformStatusForWrite(status: string | null): string | null {
+  if (status === "Descoped") return "Cancelled";
+  return status;
+}
 
 // ============================================================================
 // Types
@@ -451,8 +487,10 @@ function columnsMappingFor(
   ];
 }
 
-/** Execute one move with retries. Returns the new item id (which on
- *  monday is the SAME id — move_item_to_board preserves it). */
+/** Execute one move with retries. After a successful move, apply any
+ *  status-text transformation (e.g. UGL "Descoped" → our "Cancelled")
+ *  via a follow-up change_simple_column_value. Returns nothing — the
+ *  caller doesn't need the id (move_item_to_board preserves it). */
 async function executeOneMove(move: PlannedMove): Promise<void> {
   const mapping = columnsMappingFor(move.fromBoard, move.toBoard);
   const variables: Record<string, unknown> = {
@@ -477,6 +515,33 @@ async function executeOneMove(move: PlannedMove): Promise<void> {
     variables,
     `move-${move.itemId}`
   );
+
+  // Status-text transform after move: when UGL says "Descoped" and
+  // the row has landed on the Cancelled board, write our internal
+  // "Cancelled" label. Uses create_labels_if_missing because the
+  // Cancelled label may not yet exist on the destination column.
+  const transformed = transformStatusForWrite(move.status);
+  if (transformed !== move.status) {
+    const targetCol = STATUS_COL_OF[move.toBoard];
+    await mondayWithRetry<{ change_simple_column_value: { id: string } }>(
+      `mutation ($boardId: ID!, $itemId: ID!, $colId: String!, $val: String!) {
+        change_simple_column_value(
+          board_id: $boardId,
+          item_id: $itemId,
+          column_id: $colId,
+          value: $val,
+          create_labels_if_missing: true
+        ) { id }
+      }`,
+      {
+        boardId: String(BOARD_ID_OF[move.toBoard]),
+        itemId: move.itemId,
+        colId: targetCol,
+        val: transformed ?? "",
+      },
+      `status-transform-${move.itemId}`
+    );
+  }
 }
 
 interface ExecuteOptions {
