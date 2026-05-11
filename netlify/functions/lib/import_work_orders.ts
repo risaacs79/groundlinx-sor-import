@@ -226,6 +226,32 @@ async function monday<T>(
   return json.data as T;
 }
 
+/** 5-attempt exponential backoff on 429 — mirrors sync_job_data.ts. */
+async function mondayWithRetry<T>(
+  query: string,
+  variables: Record<string, unknown> = {},
+  label = "monday"
+): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await monday<T>(query, variables);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("429") && attempt < 4) {
+        const wait = Math.min(60_000, 5000 * Math.pow(2, attempt));
+        console.warn(
+          `[import_work_orders] ${label}: 429 rate-limited, sleeping ${wait}ms (attempt ${attempt + 2}/5)`
+        );
+        await new Promise((r) => setTimeout(r, wait));
+        attempt += 1;
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 // ---------- Spreadsheet parser (mirrors sync_sor_extract.ts) ----------
 function cellText(v: ExcelJS.CellValue): string | null {
   if (v == null) return null;
@@ -363,34 +389,54 @@ async function readExtract(
   }
 
   const rows: ExtractRow[] = [];
+  const rowErrors: Array<{ row: number; error: string }> = [];
+  // Per-row try/catch — one bad cell shouldn't kill the whole stage.
+  // Track G3 (May 2026): part of the diagnostic-layer push.
   for (let r = 2; r <= ws.rowCount; r++) {
-    const row = ws.getRow(r);
-    const getCell = (field: string) => {
-      const col = colByField[field];
-      return col == null ? null : row.getCell(col).value;
-    };
-    const assetId = cellText(getCell("assetId"));
-    const sor = cellText(getCell("sor"));
-    if (!assetId || !sor) continue;
-    rows.push({
-      rowIndex: r,
-      projectId: cellText(getCell("projectId")),
-      ada: cellText(getCell("ada")),
-      assetId,
-      sor,
-      sorDescription: cellText(getCell("sorDescription")),
-      designQty: cellNumber(getCell("designQty")),
-      actualQty: cellNumber(getCell("actualQty")),
-      acceptedQty: cellNumber(getCell("acceptedQty")),
-      consStatus: cellText(getCell("consStatus")),
-      sorStatus: cellText(getCell("sorStatus")),
-      invoiceNo: cellText(getCell("invoiceNo")),
-      constructionDate: cellDateIso(getCell("constructionDate")),
-      reviewDate: cellDateIso(getCell("reviewDate")),
-      comments: cellText(getCell("comments")),
-      address: cellText(getCell("address")),
-    });
+    try {
+      const row = ws.getRow(r);
+      const getCell = (field: string) => {
+        const col = colByField[field];
+        return col == null ? null : row.getCell(col).value;
+      };
+      const assetId = cellText(getCell("assetId"));
+      const sor = cellText(getCell("sor"));
+      if (!assetId || !sor) continue;
+      rows.push({
+        rowIndex: r,
+        projectId: cellText(getCell("projectId")),
+        ada: cellText(getCell("ada")),
+        assetId,
+        sor,
+        sorDescription: cellText(getCell("sorDescription")),
+        designQty: cellNumber(getCell("designQty")),
+        actualQty: cellNumber(getCell("actualQty")),
+        acceptedQty: cellNumber(getCell("acceptedQty")),
+        consStatus: cellText(getCell("consStatus")),
+        sorStatus: cellText(getCell("sorStatus")),
+        invoiceNo: cellText(getCell("invoiceNo")),
+        constructionDate: cellDateIso(getCell("constructionDate")),
+        reviewDate: cellDateIso(getCell("reviewDate")),
+        comments: cellText(getCell("comments")),
+        address: cellText(getCell("address")),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      rowErrors.push({ row: r, error: msg.slice(0, 250) });
+      console.warn(`[import_work_orders] row ${r} parse failed: ${msg}`);
+    }
   }
+  console.log(
+    `[import_work_orders] readExtract done — rows=${rows.length} rowErrors=${rowErrors.length}`
+  );
+  // Attach the parse errors so callers can surface them in summaries.
+  // Existing signature returns ExtractRow[], we'd break callers if we
+  // changed it. Stash on the array via a non-enumerable property — the
+  // caller (runImportWorkOrders) can read `(rows as any).__rowErrors`.
+  Object.defineProperty(rows, "__rowErrors", {
+    value: rowErrors,
+    enumerable: false,
+  });
   return rows;
 }
 
@@ -900,8 +946,15 @@ async function applyPlan(
   // that don't have one. Need to capture the new monday IDs so we can
   // link Primary Asset on the Active Jobs row in Phase 2.
   const needsNetwork = toCreate.filter((p) => p.needsNetworkAsset);
+  const nwBatchTotal = Math.ceil(needsNetwork.length / BATCH_SIZE);
+  if (needsNetwork.length > 0) {
+    console.log(
+      `[import_work_orders] phase 1 (network assets) — ${needsNetwork.length} to create across ${nwBatchTotal} batches`
+    );
+  }
   for (let i = 0; i < needsNetwork.length; i += BATCH_SIZE) {
     const batch = needsNetwork.slice(i, i + BATCH_SIZE);
+    const batchIndex = Math.floor(i / BATCH_SIZE) + 1;
     const aliases: string[] = [];
     const variables: Record<string, unknown> = {
       boardId: String(NETWORK_ASSETS_BOARD),
@@ -930,8 +983,23 @@ async function applyPlan(
       .map((_, j) => `$name${j}: String!, $cv${j}: JSON!`)
       .join(", ");
     const query = `mutation ($boardId: ID!, ${argsList}) { ${aliases.join("\n")} }`;
+    const t0 = Date.now();
+    console.log(
+      `[import_work_orders] phase 1 batch ${batchIndex}/${nwBatchTotal} size=${batch.length}`
+    );
     try {
-      const data = await monday<Record<string, { id: string }>>(query, variables);
+      const data = await mondayWithRetry<Record<string, { id: string }>>(
+        query,
+        variables,
+        `phase1-network-batch-${batchIndex}`
+      );
+      console.log(
+        `[import_work_orders] phase 1 batch ${batchIndex}/${nwBatchTotal} done in ${Date.now() - t0}ms`
+      );
+      // 250ms inter-batch breather to smooth out rate-limit risk.
+      if (i + BATCH_SIZE < needsNetwork.length) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
       batch.forEach((p, j) => {
         const newId = data[`n${j}`]?.id;
         if (newId) {
@@ -941,8 +1009,12 @@ async function applyPlan(
       });
     } catch (err) {
       result.failed += batch.length;
+      const msg = (err instanceof Error ? err.message : String(err)).slice(0, 250);
       result.failures.push(
-        `network-asset batch ${i}: ${(err instanceof Error ? err.message : String(err)).slice(0, 250)}`
+        `network-asset batch ${batchIndex}/${nwBatchTotal} (rows starting at ${i}): ${msg}`
+      );
+      console.error(
+        `[import_work_orders] phase 1 batch ${batchIndex}/${nwBatchTotal} FAILED after ${Date.now() - t0}ms: ${msg}`
       );
     }
   }
@@ -963,9 +1035,14 @@ async function applyPlan(
     if (items.length === 0) continue;
     const boardId = targetBoardId(target);
     const COL = target === "approved" ? APPROVED_COL : ACTIVE_COL;
+    const targetBatchTotal = Math.ceil(items.length / BATCH_SIZE);
+    console.log(
+      `[import_work_orders] phase 2 (${target}) — ${items.length} to create across ${targetBatchTotal} batches`
+    );
 
     for (let i = 0; i < items.length; i += BATCH_SIZE) {
       const batch = items.slice(i, i + BATCH_SIZE);
+      const batchIndex = Math.floor(i / BATCH_SIZE) + 1;
       const aliases: string[] = [];
       const variables: Record<string, unknown> = { boardId: String(boardId) };
       batch.forEach((p, j) => {
@@ -1070,17 +1147,35 @@ async function applyPlan(
         .map((_, j) => `$name${j}: String!, $cv${j}: JSON!`)
         .join(", ");
       const query = `mutation ($boardId: ID!, ${argsList}) { ${aliases.join("\n")} }`;
+      const t0 = Date.now();
+      console.log(
+        `[import_work_orders] phase 2 (${target}) batch ${batchIndex}/${targetBatchTotal} size=${batch.length}`
+      );
       try {
-        await monday(query, variables);
+        await mondayWithRetry(
+          query,
+          variables,
+          `phase2-${target}-batch-${batchIndex}`
+        );
         if (target === "active") result.createdActive += batch.length;
         else if (target === "jobComplete") result.createdJobComplete += batch.length;
         else if (target === "submitted") result.createdSubmitted += batch.length;
         else result.createdApproved += batch.length;
+        console.log(
+          `[import_work_orders] phase 2 (${target}) batch ${batchIndex}/${targetBatchTotal} done in ${Date.now() - t0}ms`
+        );
       } catch (err) {
         result.failed += batch.length;
+        const msg = (err instanceof Error ? err.message : String(err)).slice(0, 250);
         result.failures.push(
-          `${target}-job batch ${i}: ${(err instanceof Error ? err.message : String(err)).slice(0, 250)}`
+          `${target}-job batch ${batchIndex}/${targetBatchTotal} (rows starting at ${i}): ${msg}`
         );
+        console.error(
+          `[import_work_orders] phase 2 (${target}) batch ${batchIndex}/${targetBatchTotal} FAILED after ${Date.now() - t0}ms: ${msg}`
+        );
+      }
+      if (i + BATCH_SIZE < items.length) {
+        await new Promise((r) => setTimeout(r, 250));
       }
     }
   }
@@ -1135,7 +1230,15 @@ export async function runImportWorkOrders(
   opts: RunImportOptions = {}
 ): Promise<ImportResult> {
   const start = Date.now();
+  console.log(`[import_work_orders] runImportWorkOrders start — buffer=${buffer.byteLength}b`);
   const extract = await readExtract(buffer, { sheet: opts.sheet });
+  // readExtract stashes per-row parse failures on a non-enumerable
+  // __rowErrors property (Track G3 diagnostic layer). Surface them in
+  // the ImportResult.failures array so they reach the Sync Run update.
+  const rowErrors = ((extract as unknown) as { __rowErrors?: Array<{ row: number; error: string }> }).__rowErrors ?? [];
+  console.log(
+    `[import_work_orders] extract=${extract.length} rows (${rowErrors.length} row-parse failures)`
+  );
   const rateCard = await fetchRateCard();
   // Track J1 + K3 fix: walk all 4 job boards so we don't recreate items
   // already on Active, Job Complete, Submitted, or Approved. Active +
@@ -1187,7 +1290,19 @@ export async function runImportWorkOrders(
   }
 
   const skipped = planned.filter((p) => p.skipReason);
+  console.log(
+    `[import_work_orders] plan: ${planned.length} planned, ${skipped.length} skipped (already exist)`
+  );
   const result = await applyPlan(planned, false, maxGl, projectMap);
+
+  // Fold row-parse errors into failures so they surface on the Sync Run.
+  const allFailures = [
+    ...result.failures,
+    ...rowErrors.map((e) => `row ${e.row} parse: ${e.error}`),
+  ];
+  console.log(
+    `[import_work_orders] runImportWorkOrders done in ${Date.now() - start}ms active=${result.createdActive} jobComplete=${result.createdJobComplete} submitted=${result.createdSubmitted} approved=${result.createdApproved} failed=${result.failed + rowErrors.length}`
+  );
 
   return {
     uniqueAssets: groups.length,
@@ -1197,8 +1312,8 @@ export async function runImportWorkOrders(
     createdSubmitted: result.createdSubmitted,
     createdApproved: result.createdApproved,
     skipped: skipped.length,
-    failed: result.failed,
-    failures: result.failures,
+    failed: result.failed + rowErrors.length,
+    failures: allFailures,
     byStatus,
     elapsedMs: Date.now() - start,
   };
