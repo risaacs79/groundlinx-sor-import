@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "netlify dev",
     "build": "echo 'static site — nothing to build'",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "find-duplicates": "tsx scripts/find_duplicates.ts",
+    "archive-dupes": "tsx scripts/archive_dupes.ts"
   },
   "dependencies": {
     "@netlify/functions": "^2.8.0",
@@ -14,7 +16,8 @@
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "tsx": "^4.19.2"
   },
   "engines": {
     "node": ">=20"

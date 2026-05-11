@@ -6,3 +6,8 @@ node_modules/
 .DS_Store
 *.log
 dist/
+
+# One-shot script outputs (operational logs — not committed)
+dupe-report.json
+archive-log.json
+manual-review.json
