@@ -46,14 +46,19 @@ const ACTIVE_JOBS_BOARD = 5028084872;
 const JOB_COMPLETE_BOARD = 5028375392;
 const SUBMITTED_JOBS_BOARD = 5028331769;
 const APPROVED_JOBS_BOARD = 5028088229;
-/** Track G3-fix5 (11 May 2026): new board for jobs UGL has descoped.
+/** Track G3-fix5 (11 May 2026): destination for jobs UGL has descoped.
  *  Duplicated from Active board (5028084872) via
  *  duplicate_board_with_structure, so column IDs are byte-identical
  *  to Active and the board is part of the active-schema cluster.
- *  Workspace 2889787 ("One Board Main WorkSpace") per Rowan's brief —
- *  note the other 4 boards live in workspace 2977219 ("Groundlinx HQ");
- *  cross-workspace routing works fine but worth knowing for views. */
-const CANCELLED_JOBS_BOARD = 5028417160;
+ *  Lives in workspace 2977219 ("Groundlinx HQ") folder 6615544
+ *  ("JOBS - Approved + Cancelled") alongside Approved & Paid Jobs.
+ *
+ *  G3-fix5a (11 May): the original duplicate (5028417160) landed in
+ *  the wrong workspace (2889787) per the brief's stale-memory ID;
+ *  that board was archived and replaced with this one in the correct
+ *  workspace + folder. The bare placeholder 5028088232 that existed
+ *  pre-fix was also archived (1 column "Name", 0 items). */
+const CANCELLED_JOBS_BOARD = 5028418115;
 
 /** "active-schema" boards share column IDs (created via
  *  duplicate_board_with_structure from Active). Approved & Paid is

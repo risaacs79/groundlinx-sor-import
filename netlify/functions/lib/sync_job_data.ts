@@ -48,11 +48,13 @@ const SUBMITTED_JOBS_BOARD = 5028331769;
 // numerics + Primary Asset relations apply equally here.
 const JOB_COMPLETE_BOARD = 5028375392;
 const APPROVED_JOBS_BOARD = 5028088229;
-// Cancelled Jobs (Track G3-fix5, 11 May 2026) — destination for
-// rows whose UGL Payment Status is "Descoped". Duplicated from Active
-// via duplicate_board_with_structure, so column IDs are byte-identical
-// to Active; same JOB_BOARDS schema reuse pattern as Job Complete.
-const CANCELLED_JOBS_BOARD = 5028417160;
+// Cancelled Jobs (Track G3-fix5, 11 May 2026) — destination for rows
+// whose UGL Payment Status is "Descoped". Duplicated from Active via
+// duplicate_board_with_structure, so column IDs are byte-identical to
+// Active; same JOB_BOARDS schema reuse pattern as Job Complete. Lives
+// in workspace 2977219 / folder 6615544 alongside Approved & Paid Jobs.
+// G3-fix5a: ID corrected from 5028417160 (wrong workspace) → 5028418115.
+const CANCELLED_JOBS_BOARD = 5028418115;
 const NETWORK_ASSETS_BOARD = 5028087505;
 const SOR_LINES_BOARD = 5028087610;
 const ASSET_PHOTOS_BOARD = 5028130740;
