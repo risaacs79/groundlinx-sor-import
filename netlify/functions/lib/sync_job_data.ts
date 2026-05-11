@@ -66,6 +66,13 @@ interface JobBoardCols {
   // null on Approved & Paid (terminal, no script writes there).
   photosRequired: string | null;
   photosTaken: string | null;
+  // Lifecycle columns — Track G3-fix4, May 2026. Present on every job
+  // board; differ between active-schema boards and Approved & Paid
+  // because the Approved board has its own schema (APPROVED_COL in
+  // import_work_orders.ts). These are the columns the CREATE path
+  // writes; the UPDATE path now keeps them in sync after status moves.
+  rcti: string;
+  uglPaymentStatus: string;
 }
 
 /**
@@ -88,6 +95,11 @@ const ACTIVE_JOB_COL_IDS: JobBoardCols = {
   disputed: "numeric_mm346gsq",
   photosRequired: "numeric_mm34xwc1",
   photosTaken: "numeric_mm344bk5",
+  // Mirrors import_work_orders.ts ACTIVE_COL.{RCTI,UGL_PAYMENT_STATUS}.
+  // Active + Job Complete + Submitted share these IDs (duplicate-board
+  // schema). Approved & Paid has its own ids — see below.
+  rcti: "text_mm2tdrdk",
+  uglPaymentStatus: "color_mm32x3ga",
 };
 
 const JOB_BOARDS: Record<"active" | "jobComplete" | "submitted" | "approved", { id: number; cols: JobBoardCols }> = {
@@ -113,6 +125,10 @@ const JOB_BOARDS: Record<"active" | "jobComplete" | "submitted" | "approved", { 
       disputed: "numeric_mm34d46f",
       photosRequired: "numeric_mm344z5c",
       photosTaken: "numeric_mm347j55",
+      // RCTI + UGL Payment Status share IDs with Active (duplicate-board
+      // origin; only the 6 SOR-revenue numerics drift per comment above).
+      rcti: "text_mm2tdrdk",
+      uglPaymentStatus: "color_mm32x3ga",
     },
   },
   approved: {
@@ -129,6 +145,10 @@ const JOB_BOARDS: Record<"active" | "jobComplete" | "submitted" | "approved", { 
       // Approved & Paid is terminal — no photo progress tracking.
       photosRequired: null,
       photosTaken: null,
+      // Approved board has its own schema (APPROVED_COL in
+      // import_work_orders.ts) — different RCTI + status column IDs.
+      rcti: "text_mm32c4fj",
+      uglPaymentStatus: "color_mm322s90",
     },
   },
 };
@@ -144,7 +164,62 @@ const SOR_COLS = {
   inReview: "formula_mm33z0sv",
   pendingArtefacts: "formula_mm338jtj",
   disputed: "formula_mm33f2bc",
+  // Track G3-fix4 (May 2026) — used to derive per-asset
+  // aggregatedStatus + rctiNumber for the lifecycle UPDATE path so
+  // existing job rows reflect the latest SOR Extract data, not the
+  // create-time snapshot.
+  uglStatus: "color_mm2tavfn",
+  invoiceNo: "text_mm2t3sb5",
 } as const;
+
+/**
+ * Status priority — most-advanced first (lowest index wins on aggregation).
+ * Mirrors STATUS_PRIORITY in import_work_orders.ts so the lifecycle
+ * UPDATE path picks the same rollup value the CREATE path would have
+ * picked. Keep these two lists in lockstep.
+ *
+ * Per the Step 2 brief: "Paid > Approved > Pending RCTI > etc."
+ */
+const STATUS_PRIORITY = [
+  "Paid",
+  "Paid - Pending RCTI",
+  "Partial Paid",
+  "Approved",
+  "In Review",
+  "Pending Artefacts",
+  "Pending Construction",
+  "Overpaid",
+  "Disputed",
+  "Descoped",
+] as const;
+
+function priorityOf(status: string | null): number {
+  if (!status) return 999;
+  const idx = STATUS_PRIORITY.indexOf(status as (typeof STATUS_PRIORITY)[number]);
+  return idx === -1 ? 999 : idx;
+}
+
+/**
+ * Per-asset lifecycle aggregation — the UPDATE path's mirror of
+ * import_work_orders.ts aggregateAsset() for the two columns the
+ * CREATE path writes but no current stage updates.
+ *
+ * aggregatedStatus: lowest-priority-index UGL Status across the
+ *   asset's SOR lines. null when every SOR line for this asset has
+ *   no UGL Status text (defensive — would only fire on freshly-seeded
+ *   assets with no extract data yet; we DON'T downgrade existing rows
+ *   to "Pending Construction" in that case).
+ * rctiNumber: first non-null Invoice # encountered in iteration order
+ *   over the asset's SOR lines. Matches the CREATE-path "first
+ *   non-null" semantic; for the common case where all lines share
+ *   one RCTI, this is unambiguous.
+ */
+interface Lifecycle {
+  aggregatedStatus: string | null;
+  rctiNumber: string | null;
+}
+
+const EMPTY_LIFECYCLE: Lifecycle = { aggregatedStatus: null, rctiNumber: null };
 
 /** Asset Photos source columns (read-only). Mirrors ASSET_PHOTO_COLUMNS in src/lib/monday-ids.ts. */
 const PHOTO_COLS = {
@@ -244,6 +319,105 @@ function approxEqual(a: number, b: number): boolean {
 interface SorLineRaw {
   asset: string;
   formulas: Record<RevenueKey, number>;
+}
+
+/**
+ * Read SOR Lines and per-asset roll up UGL Status + first RCTI. Mirror
+ * of import_work_orders.ts aggregateAsset() for the two lifecycle
+ * columns the CREATE path writes. Track G3-fix4 (May 2026).
+ *
+ * Aggregation rules — same as the CREATE path:
+ *   aggregatedStatus = lowest STATUS_PRIORITY index across the asset's
+ *     SOR lines. Empty/unknown statuses contribute priority 999 so they
+ *     never win a non-empty row. If EVERY SOR line for an asset is
+ *     empty/unknown, aggregatedStatus stays null (defensive — we don't
+ *     downgrade existing rows to "Pending Construction" the way CREATE
+ *     does, because we don't know the existing row's history).
+ *   rctiNumber = first non-null Invoice # encountered in iteration
+ *     order. monday returns SOR Lines in insertion order, which is
+ *     stable for a given board state.
+ *
+ * Both fields are best-effort: nulls signal "don't write" downstream.
+ */
+async function fetchSorLifecycleByAsset(): Promise<Map<string, Lifecycle>> {
+  const cols = [SOR_COLS.assetText, SOR_COLS.uglStatus, SOR_COLS.invoiceNo];
+  type RawCol = { id: string; text: string | null };
+  type RawItem = { column_values: RawCol[] };
+
+  // Per-asset accumulators.
+  const aggIdx = new Map<string, number>(); // asset → current best priority idx
+  const aggStatus = new Map<string, string>(); // asset → label corresponding to aggIdx
+  const aggRcti = new Map<string, string>(); // asset → first non-null invoice #
+
+  let cursor: string | null = null;
+  let pages = 0;
+  let rowsSeen = 0;
+  for (let pg = 1; pg <= 20; pg++) {
+    pages = pg;
+    const data = await monday<{
+      boards?: Array<{ items_page: { cursor: string | null; items: RawItem[] } }>;
+      next_items_page?: { cursor: string | null; items: RawItem[] };
+    }>(
+      cursor
+        ? `query ($cursor: String!, $col: [String!]) {
+            next_items_page(limit: 500, cursor: $cursor) {
+              cursor items { column_values(ids: $col) { id text } }
+            }
+          }`
+        : `query ($boardId: ID!, $col: [String!]) {
+            boards(ids: [$boardId]) {
+              items_page(limit: 500) {
+                cursor items { column_values(ids: $col) { id text } }
+              }
+            }
+          }`,
+      cursor ? { cursor, col: cols } : { boardId: String(SOR_LINES_BOARD), col: cols }
+    );
+    const page: { cursor: string | null; items: RawItem[] } = cursor
+      ? data.next_items_page!
+      : data.boards![0].items_page;
+    for (const it of page.items) {
+      rowsSeen += 1;
+      const cv: Record<string, RawCol> = {};
+      for (const c of it.column_values) cv[c.id] = c;
+      const asset = (cv[SOR_COLS.assetText]?.text ?? "").trim();
+      if (!asset) continue;
+      const statusText = cv[SOR_COLS.uglStatus]?.text?.trim() || null;
+      const invoiceText = cv[SOR_COLS.invoiceNo]?.text?.trim() || null;
+      // Status — keep the lowest-priority-index seen so far.
+      const idx = priorityOf(statusText);
+      const currentIdx = aggIdx.get(asset);
+      if (currentIdx == null || idx < currentIdx) {
+        if (statusText) {
+          aggIdx.set(asset, idx);
+          aggStatus.set(asset, statusText);
+        } else if (currentIdx == null) {
+          // Record the 999 so subsequent empty rows don't keep retrying.
+          aggIdx.set(asset, 999);
+        }
+      }
+      // RCTI — first non-null wins.
+      if (invoiceText && !aggRcti.has(asset)) {
+        aggRcti.set(asset, invoiceText);
+      }
+    }
+    if (!page.cursor) break;
+    cursor = page.cursor;
+  }
+  console.log(
+    `[sync-job-data] fetchSorLifecycleByAsset: ${rowsSeen} SOR Lines across ${pages} pages → ${aggStatus.size} assets with status, ${aggRcti.size} with RCTI`
+  );
+  const byAsset = new Map<string, Lifecycle>();
+  // Build the result over the union of seen assets so null fields are
+  // explicit rather than missing.
+  const allAssets = new Set<string>([...aggStatus.keys(), ...aggRcti.keys()]);
+  for (const asset of allAssets) {
+    byAsset.set(asset, {
+      aggregatedStatus: aggStatus.get(asset) ?? null,
+      rctiNumber: aggRcti.get(asset) ?? null,
+    });
+  }
+  return byAsset;
 }
 
 async function fetchSorRevenueByAsset(): Promise<Map<string, Revenue>> {
@@ -573,17 +747,37 @@ interface JobItem {
   currentRevenue: Revenue;
   /** Current photo progress (only meaningful for active+jobComplete+submitted; null on approved). */
   currentPhotos: PhotoProgress | null;
+  /** Current RCTI Number column value on monday (null when blank). */
+  currentRctiNumber: string | null;
+  /** Current UGL Payment Status label on monday (null when blank). */
+  currentUglPaymentStatus: string | null;
   desiredPrimary: string | null;
   desiredRevenue: Revenue;
   /** Desired photo progress for active+jobComplete+submitted; null on approved (no writes). */
   desiredPhotos: PhotoProgress | null;
+  /** Desired RCTI Number from the SOR Lines roll-up. null = no write. */
+  desiredRctiNumber: string | null;
+  /** Desired UGL Payment Status from the SOR Lines roll-up. null = no write
+   *  (defensive — only set when at least one SOR line has a status). */
+  desiredUglPaymentStatus: string | null;
   isTest: boolean;
   unmatchedAsset: boolean;
 }
 
+type JobItemRaw = Omit<
+  JobItem,
+  | "desiredPrimary"
+  | "desiredRevenue"
+  | "desiredPhotos"
+  | "desiredRctiNumber"
+  | "desiredUglPaymentStatus"
+  | "isTest"
+  | "unmatchedAsset"
+>;
+
 async function fetchJobBoardItems(
   boardKey: "active" | "jobComplete" | "submitted" | "approved"
-): Promise<Array<Omit<JobItem, "desiredPrimary" | "desiredRevenue" | "desiredPhotos" | "isTest" | "unmatchedAsset">>> {
+): Promise<JobItemRaw[]> {
   const board = JOB_BOARDS[boardKey];
   const cols = [
     board.cols.asset,
@@ -596,8 +790,10 @@ async function fetchJobBoardItems(
     board.cols.disputed,
     ...(board.cols.photosRequired ? [board.cols.photosRequired] : []),
     ...(board.cols.photosTaken ? [board.cols.photosTaken] : []),
+    board.cols.rcti,
+    board.cols.uglPaymentStatus,
   ];
-  const out: Array<Omit<JobItem, "desiredPrimary" | "desiredRevenue" | "desiredPhotos" | "isTest" | "unmatchedAsset">> = [];
+  const out: JobItemRaw[] = [];
   let cursor: string | null = null;
   for (let pg = 1; pg <= 5; pg++) {
     const data = await monday<{
@@ -646,6 +842,8 @@ async function fetchJobBoardItems(
               taken: parseFormula(cv[board.cols.photosTaken]?.text),
             }
           : null;
+      const rctiText = cv[board.cols.rcti]?.text?.trim() || null;
+      const statusText = cv[board.cols.uglPaymentStatus]?.text?.trim() || null;
       out.push({
         boardKey,
         boardId: board.id,
@@ -663,6 +861,8 @@ async function fetchJobBoardItems(
           disputed: parseFormula(cv[board.cols.disputed]?.text),
         },
         currentPhotos,
+        currentRctiNumber: rctiText,
+        currentUglPaymentStatus: statusText,
       });
     }
     if (!page.cursor) break;
@@ -681,11 +881,12 @@ function isTestAssetText(asset: string): boolean {
 }
 
 function buildPlan(
-  raw: Awaited<ReturnType<typeof fetchJobBoardItems>>[number],
+  raw: JobItemRaw,
   network: Map<string, string>,
   sorByAsset: Map<string, Revenue>,
   sorMethodsByAsset: Map<string, SorMethodRow[]>,
-  photosByAssetItemId: Map<string, PhotoRow[]>
+  photosByAssetItemId: Map<string, PhotoRow[]>,
+  lifecycleByAsset: Map<string, Lifecycle>
 ): JobItem {
   const isTest = isTestAssetText(raw.asset);
   const networkId = raw.asset ? network.get(raw.asset) ?? null : null;
@@ -700,6 +901,7 @@ function buildPlan(
     const photos = networkId ? photosByAssetItemId.get(networkId) : undefined;
     desiredPhotos = computePhotoProgress(sorRows, photos);
   }
+  const lifecycle = lifecycleByAsset.get(raw.asset) ?? EMPTY_LIFECYCLE;
   return {
     ...raw,
     isTest,
@@ -707,10 +909,17 @@ function buildPlan(
     desiredPrimary: networkId,
     desiredRevenue,
     desiredPhotos,
+    desiredRctiNumber: lifecycle.rctiNumber,
+    desiredUglPaymentStatus: lifecycle.aggregatedStatus,
   };
 }
 
-function planNeedsWrite(p: JobItem): { primary: boolean; revenue: boolean; photos: boolean } {
+function planNeedsWrite(p: JobItem): {
+  primary: boolean;
+  revenue: boolean;
+  photos: boolean;
+  lifecycle: boolean;
+} {
   const wantPrimary = p.desiredPrimary != null;
   const havePrimary = p.currentPrimary.length === 1 && p.currentPrimary[0] === p.desiredPrimary;
   const primary = wantPrimary && !havePrimary;
@@ -726,7 +935,19 @@ function planNeedsWrite(p: JobItem): { primary: boolean; revenue: boolean; photo
       p.desiredPhotos.required !== p.currentPhotos.required ||
       p.desiredPhotos.taken !== p.currentPhotos.taken;
   }
-  return { primary, revenue, photos };
+  // Lifecycle: only flag a write when we have a definite desired value
+  // AND it differs from the current monday value. null desired means
+  // "we don't have SOR Lines data for this asset" — leave the row
+  // alone (the create-path's "Pending Construction" fallback is for
+  // initial CREATE, not for downgrading existing rows).
+  const rctiChanged =
+    p.desiredRctiNumber != null &&
+    p.desiredRctiNumber !== p.currentRctiNumber;
+  const statusChanged =
+    p.desiredUglPaymentStatus != null &&
+    p.desiredUglPaymentStatus !== p.currentUglPaymentStatus;
+  const lifecycle = rctiChanged || statusChanged;
+  return { primary, revenue, photos, lifecycle };
 }
 
 interface ApplyResult {
@@ -734,6 +955,10 @@ interface ApplyResult {
   primaryWrites: number;
   revenueWrites: number;
   photoWrites: number;
+  /** Items that had RCTI or UGL Payment Status updated this run. Diff-
+   *  only — only counts assets whose desired value differed from the
+   *  current monday value. Added in Track G3-fix4 (May 2026). */
+  lifecycleWrites: number;
   unchanged: number;
   testItems: number;
   unmatchedItems: number;
@@ -750,6 +975,7 @@ async function applyForBoard(
     primaryWrites: 0,
     revenueWrites: 0,
     photoWrites: 0,
+    lifecycleWrites: 0,
     unchanged: 0,
     testItems: plans.filter((p) => p.isTest).length,
     unmatchedItems: plans.filter((p) => p.unmatchedAsset).length,
@@ -759,17 +985,18 @@ async function applyForBoard(
 
   const writes: Array<{
     plan: JobItem;
-    needs: { primary: boolean; revenue: boolean; photos: boolean };
+    needs: { primary: boolean; revenue: boolean; photos: boolean; lifecycle: boolean };
   }> = [];
   for (const p of plans) {
     const needs = planNeedsWrite(p);
-    if (!needs.primary && !needs.revenue && !needs.photos) {
+    if (!needs.primary && !needs.revenue && !needs.photos && !needs.lifecycle) {
       result.unchanged += 1;
       continue;
     }
     if (needs.primary) result.primaryWrites += 1;
     if (needs.revenue) result.revenueWrites += 1;
     if (needs.photos) result.photoWrites += 1;
+    if (needs.lifecycle) result.lifecycleWrites += 1;
     writes.push({ plan: p, needs });
   }
   if (dryRun) return result;
@@ -797,11 +1024,30 @@ async function applyForBoard(
         colValues[w.plan.cols.photosRequired] = w.plan.desiredPhotos.required;
         colValues[w.plan.cols.photosTaken] = w.plan.desiredPhotos.taken;
       }
+      if (w.needs.lifecycle) {
+        // Diff-only: write each column only when its desired value
+        // differs from the current monday value. Skip null desireds.
+        if (
+          w.plan.desiredRctiNumber != null &&
+          w.plan.desiredRctiNumber !== w.plan.currentRctiNumber
+        ) {
+          colValues[w.plan.cols.rcti] = w.plan.desiredRctiNumber;
+        }
+        if (
+          w.plan.desiredUglPaymentStatus != null &&
+          w.plan.desiredUglPaymentStatus !== w.plan.currentUglPaymentStatus
+        ) {
+          colValues[w.plan.cols.uglPaymentStatus] = {
+            label: w.plan.desiredUglPaymentStatus,
+          };
+        }
+      }
       aliases.push(
         `m${j}: change_multiple_column_values(
           board_id: $bid${j},
           item_id: $iid${j},
-          column_values: $val${j}
+          column_values: $val${j},
+          create_labels_if_missing: true
         ) { id }`
       );
       variables[`bid${j}`] = String(w.plan.boardId);
@@ -867,6 +1113,7 @@ export async function runSyncJobData(): Promise<SyncJobDataResult> {
   const [
     sorByAsset,
     sorMethodsByAsset,
+    lifecycleByAsset,
     networkIdx,
     photosByAssetItemId,
     activeRaw,
@@ -876,6 +1123,7 @@ export async function runSyncJobData(): Promise<SyncJobDataResult> {
   ] = await Promise.all([
     fetchSorRevenueByAsset(),
     fetchSorMethodsByAsset(),
+    fetchSorLifecycleByAsset(),
     fetchNetworkAssetIndex(),
     fetchPhotosByAssetItemId(),
     fetchJobBoardItems("active"),
@@ -886,16 +1134,16 @@ export async function runSyncJobData(): Promise<SyncJobDataResult> {
   const network = networkIdx.byName;
 
   const activePlans = activeRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset)
   );
   const jobCompletePlans = jobCompleteRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset)
   );
   const submittedPlans = submittedRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset)
   );
   const approvedPlans = approvedRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset)
   );
 
   // Sequential to keep monday rate-limit pressure bounded.
@@ -905,10 +1153,10 @@ export async function runSyncJobData(): Promise<SyncJobDataResult> {
   const approved = await applyForBoard(approvedPlans, false);
 
   const totalWrites =
-    active.primaryWrites + active.revenueWrites + active.photoWrites +
-    jobComplete.primaryWrites + jobComplete.revenueWrites + jobComplete.photoWrites +
-    submitted.primaryWrites + submitted.revenueWrites + submitted.photoWrites +
-    approved.primaryWrites + approved.revenueWrites + approved.photoWrites;
+    active.primaryWrites + active.revenueWrites + active.photoWrites + active.lifecycleWrites +
+    jobComplete.primaryWrites + jobComplete.revenueWrites + jobComplete.photoWrites + jobComplete.lifecycleWrites +
+    submitted.primaryWrites + submitted.revenueWrites + submitted.photoWrites + submitted.lifecycleWrites +
+    approved.primaryWrites + approved.revenueWrites + approved.photoWrites + approved.lifecycleWrites;
   const totalFailed = active.failed + jobComplete.failed + submitted.failed + approved.failed;
 
   return {
