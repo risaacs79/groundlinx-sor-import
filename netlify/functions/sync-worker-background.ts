@@ -145,71 +145,182 @@ interface WorkerPayload {
 }
 
 export default async (req: Request): Promise<Response> => {
-  // Netlify forces 202 once we return — the caller (our sync.ts wrapper)
-  // is fire-and-forget so it doesn't read the response. We still
-  // return early on 401 to short-circuit the function before any work
-  // fires, which is the actual security mechanism here.
+  // Netlify v2 background-function contract:
+  //   - The `-background` SUFFIX on this file's name is what makes the
+  //     CDN emit 202 to the caller (sync.ts) automatically the moment
+  //     it routes the request, AND extends our budget to 15 minutes.
+  //   - Our return value DOES NOT trigger the 202 — it's already on the
+  //     wire by the time we run.
+  //   - Lambda freezes the execution context the moment the handler
+  //     promise resolves. Any pending promise we hand-rolled outside an
+  //     `await` (e.g. `void runPipeline()`) gets orphaned and dies with
+  //     the container. This was the live bug as of commit 7aa4093:
+  //     audit rows stuck at Running forever because runPipeline's
+  //     status-update tail never executed.
+  //
+  // So: AWAIT the work, then return. Status code on our Response is
+  // logged by Netlify but otherwise ignored.
   console.log(
     `[sync-worker-bg] invoked: method=${req.method} url=${req.url}`
   );
 
-  if (req.method !== "POST") {
-    console.warn(`[sync-worker-bg] rejected: non-POST method ${req.method}`);
-    return new Response(null, { status: 405 });
-  }
-
-  // Secret moved to x-internal-secret header (G2-fix1). Header is the
-  // cleaner place for an auth credential — the body stays pure data.
-  const expected = process.env.INTERNAL_SYNC_SECRET;
-  if (!expected) {
-    console.error("[sync-worker-bg] INTERNAL_SYNC_SECRET env var not set");
-    return new Response(null, { status: 500 });
-  }
-  const provided = req.headers.get("x-internal-secret");
-  if (provided !== expected) {
-    console.warn(
-      `[sync-worker-bg] rejected POST: x-internal-secret mismatch (received ${provided ? "<value>" : "<missing>"})`
-    );
-    return new Response(null, { status: 401 });
-  }
-
-  let payload: WorkerPayload;
-  try {
-    payload = (await req.json()) as WorkerPayload;
-  } catch (err) {
-    console.error("[sync-worker-bg] invalid JSON body:", err);
-    return new Response(null, { status: 400 });
-  }
-
-  const { runId, mondayItemId, filename, fileBase64 } = payload;
-  if (!runId || !mondayItemId || !fileBase64) {
-    console.error(
-      `[sync-worker-bg] rejected POST: missing required fields runId=${!!runId} mondayItemId=${!!mondayItemId} fileBase64=${!!fileBase64}`
-    );
-    return new Response(null, { status: 400 });
-  }
-
-  // We're committed to the work — log the start and run it. The 202
-  // gets emitted to our caller (sync.ts) as soon as we return; the
-  // function continues until runPipeline finishes (up to 15 min).
+  // --- Track G3 (May 2026): master diagnostic wrapper ---
+  // Every code path that learns mondayItemId — even ones that error out
+  // before the pipeline runs — should flip the audit row from Running to
+  // Failed and stamp Finished At. The orphan-detection invariant is:
+  //   any row with status=Running AND finishedAt=null AND
+  //   startedAt > 30min ago = an orphan that escaped our error handling.
+  let mondayItemId: string | null = null;
+  let runId: string | null = null;
   const startedAt = new Date();
-  console.log(
-    `[sync-worker-bg] runId=${runId} mondayItemId=${mondayItemId} filename="${filename ?? "?"}" — pipeline starting`
-  );
+  let pipelineFinalized = false;
 
-  // Decode buffer + run pipeline. Wrap in async IIFE so we can return
-  // the 202 immediately while the work continues.
-  void runPipeline(
-    Buffer.from(fileBase64, "base64"),
-    filename ?? "extract.xlsx",
-    mondayItemId,
-    runId,
-    startedAt
-  );
+  try {
+    if (req.method !== "POST") {
+      console.warn(`[sync-worker-bg] rejected: non-POST method ${req.method}`);
+      return new Response(null, { status: 405 });
+    }
 
-  // Returning here lets Netlify emit 202 to the caller. The runPipeline
-  // promise keeps running until it resolves (up to 15 min budget).
-  return new Response(null, { status: 202 });
+    // Secret moved to x-internal-secret header (G2-fix1).
+    const expected = process.env.INTERNAL_SYNC_SECRET;
+    if (!expected) {
+      console.error("[sync-worker-bg] INTERNAL_SYNC_SECRET env var not set");
+      return new Response(null, { status: 500 });
+    }
+    const provided = req.headers.get("x-internal-secret");
+    if (provided !== expected) {
+      console.warn(
+        `[sync-worker-bg] rejected POST: x-internal-secret mismatch (received ${provided ? "<value>" : "<missing>"})`
+      );
+      return new Response(null, { status: 401 });
+    }
+
+    let payload: WorkerPayload;
+    try {
+      payload = (await req.json()) as WorkerPayload;
+    } catch (err) {
+      console.error("[sync-worker-bg] invalid JSON body:", err);
+      return new Response(null, { status: 400 });
+    }
+
+    const { filename, fileBase64 } = payload;
+    runId = payload.runId ?? null;
+    mondayItemId = payload.mondayItemId ?? null;
+    if (!runId || !mondayItemId || !fileBase64) {
+      console.error(
+        `[sync-worker-bg] rejected POST: missing required fields runId=${!!runId} mondayItemId=${!!mondayItemId} fileBase64=${!!fileBase64}`
+      );
+      return new Response(null, { status: 400 });
+    }
+
+    console.log(
+      `[sync-worker-bg] runId=${runId} mondayItemId=${mondayItemId} filename="${filename ?? "?"}" fileSize=${fileBase64.length}b(b64) — pipeline starting`
+    );
+
+    // AWAIT the pipeline. Netlify keeps the function alive because of
+    // the -background filename suffix, not because of what we return.
+    // runPipeline owns its own status updates (success + failure paths).
+    await runPipeline(
+      Buffer.from(fileBase64, "base64"),
+      filename ?? "extract.xlsx",
+      mondayItemId,
+      runId,
+      startedAt
+    );
+    pipelineFinalized = true;
+    return new Response(null, { status: 202 });
+  } catch (err) {
+    // Master catch — fires only if runPipeline THROWS something its
+    // own inner try/catch didn't handle (it shouldn't, but defense in
+    // depth). Also catches anything in the pre-pipeline setup that
+    // happens AFTER we learned mondayItemId.
+    const msg = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack ?? msg : msg;
+    console.error(
+      `[sync-worker-bg] runId=${runId ?? "?"} master catch:`,
+      stack
+    );
+    if (mondayItemId) {
+      pipelineFinalized = true; // we're handling it here
+      const finishedAt = new Date();
+      const durationSec = Math.round(
+        (finishedAt.getTime() - startedAt.getTime()) / 1000
+      );
+      try {
+        await updateSyncRunItem(mondayItemId, {
+          status: "Failed",
+          finishedAt,
+          durationSec,
+          rowsUpdated: 0,
+          jobsCreatedActive: 0,
+          jobsCreatedApproved: 0,
+          failedCount: 1,
+          errorMessage: `[master-catch] ${msg}`.slice(0, 1000),
+        });
+      } catch (innerErr) {
+        console.error(
+          `[sync-worker-bg] runId=${runId ?? "?"} master-catch updateSyncRunItem failed:`,
+          innerErr
+        );
+      }
+      try {
+        await postSyncRunUpdate(
+          mondayItemId,
+          [
+            `runId: ${runId ?? "(unknown)"}`,
+            `finished: ${finishedAt.toISOString()}`,
+            `final status: Failed (master catch)`,
+            "",
+            "Error:",
+            msg,
+            "",
+            "Stack:",
+            stack,
+          ].join("\n")
+        );
+      } catch (innerErr) {
+        console.error(
+          `[sync-worker-bg] runId=${runId ?? "?"} master-catch postSyncRunUpdate failed:`,
+          innerErr
+        );
+      }
+    }
+    return new Response(null, { status: 500 });
+  } finally {
+    // Defence-in-depth: if neither the success nor failure path stamped
+    // a final state — e.g. the handler returned early via a 4xx after
+    // learning mondayItemId — flip the row to Failed and stamp Finished
+    // At so it never sticks in Running. This is what makes future
+    // orphans detectable: status=Running AND finishedAt=null AND
+    // startedAt > 30min ago = orphan candidate.
+    if (!pipelineFinalized && mondayItemId) {
+      const finishedAt = new Date();
+      const durationSec = Math.round(
+        (finishedAt.getTime() - startedAt.getTime()) / 1000
+      );
+      console.warn(
+        `[sync-worker-bg] runId=${runId ?? "?"} finalize-in-finally — pipelineFinalized=false; stamping Finished At as a defence backstop`
+      );
+      try {
+        await updateSyncRunItem(mondayItemId, {
+          status: "Failed",
+          finishedAt,
+          durationSec,
+          rowsUpdated: 0,
+          jobsCreatedActive: 0,
+          jobsCreatedApproved: 0,
+          failedCount: 1,
+          errorMessage:
+            "Worker exited before runPipeline registered completion — likely an early return after audit-row creation (4xx). Check Netlify function logs around this runId.",
+        });
+      } catch (innerErr) {
+        console.error(
+          `[sync-worker-bg] runId=${runId ?? "?"} finally-block update failed:`,
+          innerErr
+        );
+      }
+    }
+  }
 };
 
 async function runPipeline(

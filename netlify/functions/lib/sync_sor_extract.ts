@@ -120,6 +120,35 @@ async function monday<T>(
   return json.data as T;
 }
 
+/** Wrap monday() with 5-attempt exponential backoff on 429s. Mirrors
+ *  the pattern already in sync_job_data.ts. Used by applyDiffs for the
+ *  bulk-write phase where rate-limit collisions are likely. */
+async function mondayWithRetry<T>(
+  query: string,
+  variables: Record<string, unknown> = {},
+  label = "monday"
+): Promise<T> {
+  let attempt = 0;
+  // 5 total attempts → waits 5s/10s/20s/40s/60s (60s cap on last).
+  while (true) {
+    try {
+      return await monday<T>(query, variables);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("429") && attempt < 4) {
+        const wait = Math.min(60_000, 5000 * Math.pow(2, attempt));
+        console.warn(
+          `[sync_sor_extract] ${label}: 429 rate-limited, sleeping ${wait}ms (attempt ${attempt + 2}/5)`
+        );
+        await new Promise((r) => setTimeout(r, wait));
+        attempt += 1;
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 // ---------- Spreadsheet reader ----------
 function cellText(v: ExcelJS.CellValue): string | null {
   if (v == null) return null;
@@ -180,7 +209,15 @@ function cellDateIso(v: ExcelJS.CellValue): string | null {
   return null;
 }
 
-async function readExtract(source: string | Buffer): Promise<ExtractRow[]> {
+interface ExtractReadResult {
+  rows: ExtractRow[];
+  /** Per-row parse failures. A bad cell in one row no longer kills
+   *  the whole read — failures land here for the worker to surface in
+   *  the Sync Run update. */
+  rowErrors: Array<{ row: number; error: string }>;
+}
+
+async function readExtract(source: string | Buffer): Promise<ExtractReadResult> {
   const wb = new ExcelJS.Workbook();
   if (typeof source === "string") {
     await wb.xlsx.readFile(source);
@@ -226,31 +263,43 @@ async function readExtract(source: string | Buffer): Promise<ExtractRow[]> {
   }
 
   const rows: ExtractRow[] = [];
+  const rowErrors: ExtractReadResult["rowErrors"] = [];
+  // Per-row try/catch — one bad cell shouldn't kill the whole stage.
+  // Track G3 (May 2026): part of the diagnostic-layer push.
   for (let r = 2; r <= ws.rowCount; r++) {
-    const row = ws.getRow(r);
-    const get = (name: string) => row.getCell(header[name]).value;
-    const assetId = cellText(get("Asset ID"));
-    const sor = cellText(get("SOR"));
-    if (!assetId || !sor) continue; // skip blank rows
-    rows.push({
-      rowIndex: r,
-      projectId: cellText(get("Project ID")),
-      ada: cellText(get("ADA")),
-      assetId,
-      sor,
-      sorDescription: cellText(get("SOR Description")),
-      designQty: cellNumber(get("Design Qty")),
-      actualQty: cellNumber(get("Actual Qty")),
-      acceptedQty: cellNumber(get("accepted_qty")),
-      consStatus: cellText(get("Cons Status")),
-      sorStatus: cellText(get("SOR Status")),
-      invoiceNo: cellText(get("Invoice #")),
-      constructionDate: cellDateIso(get("construction_date")),
-      reviewDate: cellDateIso(get("review_date")),
-      comments: cellText(get("comments")),
-    });
+    try {
+      const row = ws.getRow(r);
+      const get = (name: string) => row.getCell(header[name]).value;
+      const assetId = cellText(get("Asset ID"));
+      const sor = cellText(get("SOR"));
+      if (!assetId || !sor) continue; // skip blank rows
+      rows.push({
+        rowIndex: r,
+        projectId: cellText(get("Project ID")),
+        ada: cellText(get("ADA")),
+        assetId,
+        sor,
+        sorDescription: cellText(get("SOR Description")),
+        designQty: cellNumber(get("Design Qty")),
+        actualQty: cellNumber(get("Actual Qty")),
+        acceptedQty: cellNumber(get("accepted_qty")),
+        consStatus: cellText(get("Cons Status")),
+        sorStatus: cellText(get("SOR Status")),
+        invoiceNo: cellText(get("Invoice #")),
+        constructionDate: cellDateIso(get("construction_date")),
+        reviewDate: cellDateIso(get("review_date")),
+        comments: cellText(get("comments")),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      rowErrors.push({ row: r, error: msg.slice(0, 250) });
+      console.warn(`[sync_sor_extract] row ${r} parse failed: ${msg}`);
+    }
   }
-  return rows;
+  console.log(
+    `[sync_sor_extract] readExtract done — rows=${rows.length} rowErrors=${rowErrors.length}`
+  );
+  return { rows, rowErrors };
 }
 
 // ---------- Monday SOR Lines fetch (paged) ----------
@@ -265,6 +314,9 @@ async function fetchAllSorLines(): Promise<MondayRow[]> {
   const colIds = JSON.stringify(Object.values(COLUMN));
 
   for (let pageNum = 1; pageNum <= 50; pageNum++) {
+    console.log(
+      `[sync_sor_extract] fetchAllSorLines page=${pageNum} cumulative=${all.length}`
+    );
     const data = await monday<{
       boards?: Array<{
         items_page: { cursor: string | null; items: RawItem[] };
@@ -438,9 +490,11 @@ async function applyDiffs(
   let updated = 0;
   let failed = 0;
   const failures: string[] = [];
+  const totalBatches = Math.ceil(toApply.length / BATCH_SIZE);
 
   for (let i = 0; i < toApply.length; i += BATCH_SIZE) {
     const batch = toApply.slice(i, i + BATCH_SIZE);
+    const batchIndex = Math.floor(i / BATCH_SIZE) + 1;
     const aliases: string[] = [];
     const variables: Record<string, unknown> = {
       boardId: String(SOR_BOARD_ID),
@@ -465,17 +519,33 @@ async function applyDiffs(
       ${aliases.join("\n")}
     }`;
 
+    const batchStart = Date.now();
+    console.log(
+      `[sync_sor_extract] applyDiffs batch ${batchIndex}/${totalBatches} size=${batch.length} items=${batch.map((d) => d.itemId).join(",")}`
+    );
     try {
-      await monday(query, variables);
+      await mondayWithRetry(query, variables, `applyDiffs-batch-${batchIndex}`);
       updated += batch.length;
+      console.log(
+        `[sync_sor_extract] applyDiffs batch ${batchIndex}/${totalBatches} done in ${Date.now() - batchStart}ms (cumulative updated=${updated})`
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       failed += batch.length;
       failures.push(
-        `batch starting at row ${i}: ${msg.slice(0, 250)} (item ids: ${batch
+        `batch ${batchIndex}/${totalBatches} (rows starting at ${i}): ${msg.slice(0, 250)} (item ids: ${batch
           .map((d) => d.itemId)
           .join(",")})`
       );
+      console.error(
+        `[sync_sor_extract] applyDiffs batch ${batchIndex}/${totalBatches} FAILED after ${Date.now() - batchStart}ms: ${msg}`
+      );
+    }
+    // 250ms inter-batch breather — same as sync_job_data.ts. Smooths
+    // out rate-limit-hit probability without lengthening a healthy run
+    // noticeably (250ms × ~6 batches = 1.5s overhead per full sync).
+    if (i + BATCH_SIZE < toApply.length) {
+      await new Promise((r) => setTimeout(r, 250));
     }
   }
   return { updated, failed, failures };
@@ -505,8 +575,17 @@ export interface SyncResult {
  */
 export async function runSyncSor(buffer: Buffer): Promise<SyncResult> {
   const start = Date.now();
-  const extract = await readExtract(buffer);
+  console.log(`[sync_sor_extract] runSyncSor start — buffer=${buffer.byteLength}b`);
+  const { rows: extract, rowErrors } = await readExtract(buffer);
+  console.log(
+    `[sync_sor_extract] runSyncSor extracted ${extract.length} rows (${rowErrors.length} row-parse failures)`
+  );
+
+  console.log(`[sync_sor_extract] runSyncSor fetching SOR Lines from monday…`);
   const monday_rows = await fetchAllSorLines();
+  console.log(
+    `[sync_sor_extract] runSyncSor monday SOR Lines fetched: ${monday_rows.length} rows`
+  );
   const index = indexMondayRows(monday_rows);
 
   const diffs: RowDiff[] = [];
@@ -544,7 +623,22 @@ export async function runSyncSor(buffer: Buffer): Promise<SyncResult> {
     }
   }
 
+  console.log(
+    `[sync_sor_extract] runSyncSor diffs=${diffs.length} unmatched=${unmatched} unchanged=${unchanged} newFieldComplete=${newFieldComplete.length} newPaid=${newPaid.length}`
+  );
+
   const result = await applyDiffs(diffs, false);
+
+  // Fold per-row parse failures into the SyncResult failures array so
+  // they surface in the Sync Run update.
+  const allFailures = [
+    ...result.failures,
+    ...rowErrors.map((e) => `row ${e.row} parse: ${e.error}`),
+  ];
+
+  console.log(
+    `[sync_sor_extract] runSyncSor done in ${Date.now() - start}ms updated=${result.updated} failed=${result.failed + rowErrors.length}`
+  );
 
   return {
     rowsProcessed: extract.length,
@@ -552,8 +646,8 @@ export async function runSyncSor(buffer: Buffer): Promise<SyncResult> {
     updated: result.updated,
     unchanged,
     unmatched,
-    failed: result.failed,
-    failures: result.failures,
+    failed: result.failed + rowErrors.length,
+    failures: allFailures,
     newFieldComplete,
     newPaid,
     elapsedMs: Date.now() - start,
