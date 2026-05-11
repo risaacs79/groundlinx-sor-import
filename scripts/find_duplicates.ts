@@ -42,6 +42,12 @@ const BOARDS = {
                rctiCol: "text_mm2tdrdk", statusCol: "color_mm32x3ga" },
   approved: { id: 5028088229, assetCol: "text_mm325kny",
               rctiCol: "text_mm32c4fj", statusCol: "color_mm322s90" },
+  // Track G3-fix5 (May 11 2026): destination board for UGL-descoped
+  // jobs. Duplicated from Active board so column IDs are byte-identical.
+  // Added to the dupe-audit walk so the post-Stage-3-migration verifier
+  // catches cross-board same-asset rows that converge here.
+  cancelled: { id: 5028418115, assetCol: "text_mm2tmm57",
+               rctiCol: "text_mm2tdrdk", statusCol: "color_mm32x3ga" },
 } as const;
 
 type BoardKey = keyof typeof BOARDS;
