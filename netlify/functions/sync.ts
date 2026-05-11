@@ -158,6 +158,56 @@ async function createSyncRunItem(
   };
 }
 
+/** Column IDs the worker writes on completion — duplicated here so the
+ *  wrapper can flip Status + Finished At + Error Message without taking
+ *  a dependency on the worker module. Kept in sync manually with
+ *  sync-worker-background.ts SYNC_RUNS_COL. */
+const SYNC_RUNS_FINISHED_AT = "date_mm35hhn7";
+const SYNC_RUNS_ERROR_MESSAGE = "long_text_mm35dhbn";
+
+/**
+ * Flip a Sync Run row to Failed when the wrapper can't even hand the
+ * work off to the worker (worker fetch failed, worker returned non-202,
+ * etc). Best-effort — swallow our own monday errors so we never throw
+ * out of the orphan-prevention helper itself.
+ */
+async function markSyncRunFailed(
+  itemId: string,
+  reason: string
+): Promise<void> {
+  const now = new Date();
+  const columnValues: Record<string, unknown> = {
+    [SYNC_RUNS_COL.status]: { label: "Failed" },
+    [SYNC_RUNS_FINISHED_AT]: {
+      date: isoDate(now),
+      time: isoTime(now),
+    },
+    [SYNC_RUNS_ERROR_MESSAGE]: reason.slice(0, 1000),
+  };
+  try {
+    await monday(
+      `mutation ($boardId: ID!, $itemId: ID!, $cols: JSON!) {
+        change_multiple_column_values(
+          board_id: $boardId,
+          item_id: $itemId,
+          column_values: $cols,
+          create_labels_if_missing: true
+        ) { id }
+      }`,
+      {
+        boardId: String(SYNC_RUNS_BOARD),
+        itemId,
+        cols: JSON.stringify(columnValues),
+      }
+    );
+  } catch (err) {
+    console.error(
+      `[sync] markSyncRunFailed(${itemId}): inner monday update failed:`,
+      err instanceof Error ? err.message : String(err)
+    );
+  }
+}
+
 // ---- Background-worker invocation ----
 
 /**
@@ -317,14 +367,22 @@ export default async (req: Request): Promise<Response> => {
   }
   const workerUrlFinal = `${workerBase}/.netlify/functions/sync-worker-background`;
 
-  // Fire-and-forget POST to the bg worker. We don't await it — but we
-  // DO chain .then/.catch so the worker invocation status (or fetch
-  // failure) lands in Netlify function logs. The user-facing 200
-  // response is not blocked on this fetch resolving.
+  // POST to the bg worker. Track G3-fix2 (May 2026): this fetch USED to
+  // be fire-and-forget (no await, with .then/.catch chained). That's the
+  // same Lambda-orphan pattern that broke `void runPipeline` in the
+  // worker — when the wrapper's handler resolves, Lambda freezes the
+  // execution context and the pending fetch never lands. Netlify logs
+  // proved it: sync wrapper completed cleanly with 0 worker invocations
+  // in the same window, audit rows stuck at Running for 3 days.
   //
-  // Secret moved from JSON body to x-internal-secret header (G2-fix1).
-  // Header is the cleaner place for an auth-style credential and keeps
-  // the body purely data.
+  // Fix: AWAIT the fetch. Netlify v2 background functions auto-emit 202
+  // very fast (CDN level, doesn't wait for handler to start), so this
+  // adds ~1s to the wrapper's 26s budget. If the worker doesn't return
+  // 202 (deploy issue, missing function, secret rotated, etc) we throw
+  // so the wrapper itself fails with a 5xx, the user sees a real error,
+  // and the audit row gets flipped to Failed.
+  //
+  // Secret in x-internal-secret header (G2-fix1).
   const payload: WorkerPayload = {
     runId,
     mondayItemId: runItem.id,
@@ -334,28 +392,66 @@ export default async (req: Request): Promise<Response> => {
   console.log(
     `[sync] runId=${runId} mondayItemId=${runItem.id} filename="${filename}" — invoking worker at ${workerUrlFinal}`
   );
-  fetch(workerUrlFinal, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-internal-secret": internal,
-    },
-    body: JSON.stringify(payload),
-  })
-    .then((r) =>
-      console.log(
-        `[sync] runId=${runId} worker trigger response: ${r.status} ${r.statusText}`
-      )
-    )
-    .catch((err) => {
-      console.error(
-        `[sync] runId=${runId} worker invocation fetch failed:`,
-        err
-      );
-    });
 
-  // Return 200 with the full audit-item context so the client can
-  // deep-link, render the filename badge, and stamp the runId.
+  let workerResponse: Response;
+  try {
+    workerResponse = await fetch(workerUrlFinal, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-internal-secret": internal,
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[sync] runId=${runId} worker invocation fetch failed:`,
+      msg
+    );
+    await markSyncRunFailed(
+      runItem.id,
+      `Worker fetch failed before invocation: ${msg}`
+    );
+    return jsonResponse(500, {
+      ok: false,
+      error: `Couldn't invoke background worker: ${msg}`,
+      runId,
+      monday_item_id: runItem.id,
+      monday_item_url: runItem.url,
+    });
+  }
+
+  console.log(
+    `[sync] runId=${runId} worker responded with status ${workerResponse.status} ${workerResponse.statusText}`
+  );
+
+  // Netlify v2 background functions emit 202 the moment the CDN routes
+  // the request. Anything else means the function didn't accept the job:
+  // 401 (secret mismatch), 404 (function not deployed), 500 (function
+  // crashed before handler ran). Surface it as a real wrapper failure.
+  if (workerResponse.status !== 202) {
+    let bodySnippet = "";
+    try {
+      bodySnippet = (await workerResponse.text()).slice(0, 500);
+    } catch {
+      /* response body wasn't readable — skip */
+    }
+    const reason = `Worker returned HTTP ${workerResponse.status} ${workerResponse.statusText} (expected 202). Body: ${bodySnippet || "(empty)"}`;
+    console.error(`[sync] runId=${runId} ${reason}`);
+    await markSyncRunFailed(runItem.id, reason);
+    return jsonResponse(500, {
+      ok: false,
+      error: reason,
+      runId,
+      monday_item_id: runItem.id,
+      monday_item_url: runItem.url,
+    });
+  }
+
+  // Worker accepted the work and is running. Return 200 with the
+  // audit-item context so the client can deep-link, render the
+  // filename badge, and stamp the runId.
   return jsonResponse(200, {
     ok: true,
     runId,
