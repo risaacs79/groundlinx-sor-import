@@ -386,13 +386,14 @@ async function runPipeline(
       r: Awaited<ReturnType<typeof runSyncJobData>>["active"]
     ): string[] => [
       `  ${label} (${r.total}):`,
-      `    primary writes: ${r.primaryWrites}`,
-      `    revenue writes: ${r.revenueWrites}`,
-      `    photo writes:   ${r.photoWrites}`,
-      `    unchanged:      ${r.unchanged}`,
-      `    TEST items:     ${r.testItems}`,
-      `    unmatched:      ${r.unmatchedItems}`,
-      `    failed:         ${r.failed}`,
+      `    primary writes:   ${r.primaryWrites}`,
+      `    revenue writes:   ${r.revenueWrites}`,
+      `    photo writes:     ${r.photoWrites}`,
+      `    lifecycle writes: ${r.lifecycleWrites}`,
+      `    unchanged:        ${r.unchanged}`,
+      `    TEST items:       ${r.testItems}`,
+      `    unmatched:        ${r.unmatchedItems}`,
+      `    failed:           ${r.failed}`,
       ...(r.failures.length > 0
         ? r.failures.slice(0, 5).map((f) => `      - ${f.slice(0, 250)}`)
         : []),
