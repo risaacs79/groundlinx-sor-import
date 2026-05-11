@@ -11,3 +11,5 @@ dist/
 dupe-report.json
 archive-log.json
 manual-review.json
+migration-log.json
+migration-plan.json
