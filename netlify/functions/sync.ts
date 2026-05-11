@@ -365,7 +365,15 @@ export default async (req: Request): Promise<Response> => {
       runId,
     });
   }
-  const workerUrlFinal = `${workerBase}/.netlify/functions/sync-worker-background`;
+  // Path MUST match the worker's `config.path` value (currently
+  // "/api/sync-worker-background" — see sync-worker-background.ts).
+  // Track G3-fix3 (May 2026): we were hitting
+  // /.netlify/functions/sync-worker-background and getting Netlify's
+  // generic 404. Setting `config.path` on a v2 function suppresses the
+  // default /.netlify/functions/<name> route — the function is reachable
+  // only at its declared config.path. The diagnostic layer caught it
+  // ("Worker returned HTTP 404 Not Found"); this is the actual fix.
+  const workerUrlFinal = `${workerBase}/api/sync-worker-background`;
 
   // POST to the bg worker. Track G3-fix2 (May 2026): this fetch USED to
   // be fire-and-forget (no await, with .then/.catch chained). That's the
