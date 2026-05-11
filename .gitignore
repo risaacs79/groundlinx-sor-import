@@ -13,3 +13,5 @@ archive-log.json
 manual-review.json
 migration-log.json
 migration-plan.json
+bulk-update-plan.json
+bulk-update-log.json
