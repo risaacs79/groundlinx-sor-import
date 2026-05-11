@@ -20,16 +20,19 @@
  * Idempotent: rows already on the right board are skipped.
  *
  * Move safety:
- *   - Same-schema moves (active ↔ jobComplete ↔ submitted): monday
- *     auto-preserves columns by ID. Active / Job Complete / Submitted
- *     were all created via duplicate_board_with_structure so they
- *     share column IDs; no explicit columns_mapping needed.
- *   - Cross-schema moves (TO or FROM Approved & Paid): explicit
- *     columns_mapping for the 4 critical columns (asset, primary,
- *     RCTI, UGL Payment Status). Other column values get re-populated
- *     by sync_job_data on the next pipeline run (it recomputes the
- *     6 SOR-revenue numerics + Primary Asset relations + the
- *     lifecycle columns added in PR #18 from the SOR Lines roll-up).
+ *   - Every move uses the same call shape — no explicit
+ *     columns_mapping. monday auto-matches columns across boards by
+ *     TITLE, which handles BOTH the same-schema cluster (Asset ID etc
+ *     have identical IDs across active/jobComplete/submitted/cancelled,
+ *     all duplicate_board_with_structure children) AND the cross-
+ *     schema crossings (TO/FROM Approved & Paid — Asset ID, Primary
+ *     Asset, RCTI Number, UGL Payment Status all have identical
+ *     TITLES on both schemas, so title-matching transfers them).
+ *   - Columns with NO title match (revenue numerics, photo counters)
+ *     drop on cross-schema moves; sync_job_data re-populates the 6
+ *     SOR revenue numerics + Primary Asset relations + the lifecycle
+ *     columns (RCTI + UGL Payment Status, PR #18) on the next
+ *     pipeline run from the SOR Lines roll-up.
  *
  * Required env: MONDAY_API_TOKEN.
  *
@@ -60,16 +63,12 @@ const APPROVED_JOBS_BOARD = 5028088229;
  *  pre-fix was also archived (1 column "Name", 0 items). */
 const CANCELLED_JOBS_BOARD = 5028418115;
 
-/** "active-schema" boards share column IDs (created via
- *  duplicate_board_with_structure from Active). Approved & Paid is
- *  the only board with a separate schema. Drives which moves need an
- *  explicit columns_mapping in the move_item_to_board mutation. */
-const ACTIVE_SCHEMA_BOARDS = new Set<number>([
-  ACTIVE_JOBS_BOARD,
-  JOB_COMPLETE_BOARD,
-  SUBMITTED_JOBS_BOARD,
-  CANCELLED_JOBS_BOARD,
-]);
+// Note: previously a `ACTIVE_SCHEMA_BOARDS` Set lived here to drive
+// which moves needed an explicit `columns_mapping` in the
+// move_item_to_board mutation. G3-fix5b dropped the per-move mapping
+// after the live migration proved that monday's title-based
+// auto-matching handles both same-schema AND cross-schema moves
+// correctly. The constant + its helper are gone.
 
 export type BoardKey =
   | "active"
@@ -456,65 +455,38 @@ export function planMoves(items: ReconcileItem[]): PlanOutput {
 // Phase C — execute
 // ============================================================================
 
-/** Cross-schema move (TO or FROM Approved board) — build a
- *  columns_mapping so the four critical columns transfer. Same-schema
- *  moves (active ↔ jobComplete ↔ submitted) return an empty array
- *  because monday's default by-id matching handles them. */
-function columnsMappingFor(
-  from: BoardKey,
-  to: BoardKey
-): Array<{ source: string; target: string }> {
-  const fromId = BOARD_ID_OF[from];
-  const toId = BOARD_ID_OF[to];
-  if (ACTIVE_SCHEMA_BOARDS.has(fromId) && ACTIVE_SCHEMA_BOARDS.has(toId)) {
-    return []; // shared schema — auto-preserved by monday
-  }
-  // The 4 critical columns we care about preserving across the
-  // active-schema ↔ approved-schema boundary. Other columns (revenue
-  // numerics, photo counters, dates, project relation) WILL be
-  // dropped if the source has them and the target has different IDs;
-  // sync_job_data re-populates revenue + lifecycle columns on the
-  // next pipeline run.
-  return [
-    { source: ASSET_COL_OF[from], target: ASSET_COL_OF[to] },
-    { source: STATUS_COL_OF[from], target: STATUS_COL_OF[to] },
-    // RCTI Number — text_mm2tdrdk (active-schema) vs text_mm32c4fj (approved)
-    {
-      source: from === "approved" ? "text_mm32c4fj" : "text_mm2tdrdk",
-      target: to === "approved" ? "text_mm32c4fj" : "text_mm2tdrdk",
-    },
-    // Primary Asset board_relation —
-    // board_relation_mm2tyedq (active-schema) vs board_relation_mm32kh12 (approved)
-    {
-      source: from === "approved" ? "board_relation_mm32kh12" : "board_relation_mm2tyedq",
-      target: to === "approved" ? "board_relation_mm32kh12" : "board_relation_mm2tyedq",
-    },
-  ];
-}
-
 /** Execute one move with retries. After a successful move, apply any
  *  status-text transformation (e.g. UGL "Descoped" → our "Cancelled")
  *  via a follow-up change_simple_column_value. Returns nothing — the
- *  caller doesn't need the id (move_item_to_board preserves it). */
+ *  caller doesn't need the id (move_item_to_board preserves it).
+ *
+ *  G3-fix5b (11 May): two API-shape corrections discovered during the
+ *  one-shot migration run via monday MCP:
+ *    1. move_item_to_board REQUIRES `group_id`. monday's docs make
+ *       it look optional but the API rejects calls without it. We
+ *       pass "topics" — the default group_id on every active-schema
+ *       board (Active was the duplicate source, and every duplicate
+ *       inherits "topics" as its default group).
+ *    2. Explicit `columns_mapping` with {source, target} structs was
+ *       rejected with "not in the expected format" against the live
+ *       API. Falling back to NO columns_mapping let monday auto-match
+ *       columns by TITLE across schemas — verified during the
+ *       migration: item 2686589503 carried Asset ID + status from
+ *       Active into Approved correctly. The auto-match handles the
+ *       active-schema ↔ approved-schema crossings we care about
+ *       (Asset ID, Primary Asset, RCTI Number, UGL Payment Status
+ *       all have identical column TITLES on both schemas).
+ *       Therefore we drop columnsMappingFor() entirely — same call
+ *       shape for every move, monday handles the schema bridge. */
 async function executeOneMove(move: PlannedMove): Promise<void> {
-  const mapping = columnsMappingFor(move.fromBoard, move.toBoard);
   const variables: Record<string, unknown> = {
     itemId: move.itemId,
     boardId: String(BOARD_ID_OF[move.toBoard]),
+    groupId: "topics",
   };
-  let query: string;
-  if (mapping.length > 0) {
-    // Pass columns_mapping inline as a JSON-safe variable (monday's
-    // schema accepts an array of {source, target} structs).
-    variables.cols = mapping;
-    query = `mutation ($itemId: ID!, $boardId: ID!, $cols: [ColumnMappingInput!]) {
-      move_item_to_board(item_id: $itemId, board_id: $boardId, columns_mapping: $cols) { id }
-    }`;
-  } else {
-    query = `mutation ($itemId: ID!, $boardId: ID!) {
-      move_item_to_board(item_id: $itemId, board_id: $boardId) { id }
-    }`;
-  }
+  const query = `mutation ($itemId: ID!, $boardId: ID!, $groupId: String!) {
+    move_item_to_board(item_id: $itemId, board_id: $boardId, group_id: $groupId) { id }
+  }`;
   await mondayWithRetry<{ move_item_to_board: { id: string } }>(
     query,
     variables,
