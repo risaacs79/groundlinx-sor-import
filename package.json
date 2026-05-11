@@ -9,7 +9,8 @@
     "type-check": "tsc --noEmit",
     "find-duplicates": "tsx scripts/find_duplicates.ts",
     "archive-dupes": "tsx scripts/archive_dupes.ts",
-    "migrate-row-placement": "tsx scripts/migrate_row_placement.ts"
+    "migrate-row-placement": "tsx scripts/migrate_row_placement.ts",
+    "bulk-update-internal-statuses": "tsx scripts/bulk_update_internal_statuses.ts"
   },
   "dependencies": {
     "@netlify/functions": "^2.8.0",
