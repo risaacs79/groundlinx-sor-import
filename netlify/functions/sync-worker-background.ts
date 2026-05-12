@@ -450,6 +450,8 @@ async function runPipeline(
       `    actualMetres writes: ${r.actualMetresWrites}`,
       `    disputeReason writes: ${r.disputeReasonWrites}`,
       `    disputed:            ${r.disputedCount}`,
+      `    jobStatusMirror writes:           ${r.jobStatusMirrorWrites}`,
+      `    jobStatusMirror skipped (already correct): ${r.jobStatusMirrorSkipped}`,
       `    unchanged:           ${r.unchanged}`,
       `    TEST items:          ${r.testItems}`,
       `    unmatched:           ${r.unmatchedItems}`,
