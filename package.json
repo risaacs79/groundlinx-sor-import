@@ -12,7 +12,9 @@
     "migrate-row-placement": "tsx scripts/migrate_row_placement.ts",
     "bulk-update-internal-statuses": "tsx scripts/bulk_update_internal_statuses.ts",
     "dry-run-design-propagation": "tsx scripts/dry_run_design_propagation.ts",
-    "live-design-propagation": "tsx scripts/run_design_propagation.ts"
+    "live-design-propagation": "tsx scripts/run_design_propagation.ts",
+    "dry-run-actual-metres-propagation": "tsx scripts/dry_run_actual_metres_propagation.ts",
+    "live-actual-metres-propagation": "tsx scripts/run_actual_metres_propagation.ts"
   },
   "dependencies": {
     "@netlify/functions": "^2.8.0",
