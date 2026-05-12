@@ -103,6 +103,14 @@ interface JobBoardCols {
   // cancelled work, per the PR's "don't" list). Distinct per-board
   // id because each board got its own column from monday.
   disputeReason: string | null;
+  // Job Status — the crew-facing lifecycle column. PR-A2 (May 2026)
+  // wires the SOR sync to MIRROR UGL Payment Status changes into
+  // this column so the crew sees a consistent lifecycle view. The
+  // mirror only fires on UGL changes (steady-state runs don't touch
+  // Job Status — protects crew-set state). null on Cancelled per
+  // brief — routing handles cancellation; the status mirror doesn't
+  // apply on that board.
+  jobStatus: string | null;
 }
 
 /**
@@ -116,9 +124,9 @@ interface JobBoardCols {
  */
 /** Shared column ids across Active / Job Complete / Cancelled. The
  *  per-board entries below spread this + override the disputeReason
- *  field (which has a distinct id on each board because monday minted
- *  unique ids when the column was added separately). */
-const ACTIVE_JOB_COL_IDS_BASE: Omit<JobBoardCols, "disputeReason"> = {
+ *  + jobStatus fields (each has a distinct id on Approved & Paid;
+ *  jobStatus is null on Cancelled). */
+const ACTIVE_JOB_COL_IDS_BASE: Omit<JobBoardCols, "disputeReason" | "jobStatus"> = {
   asset: "text_mm2tmm57",
   primary: "board_relation_mm2tyedq",
   forecast: "numeric_mm341c4r",
@@ -148,6 +156,10 @@ const JOB_BOARDS: Record<
       ...ACTIVE_JOB_COL_IDS_BASE,
       // PR-A (May 2026) — Active board's 🚨 Dispute Reason long_text.
       disputeReason: "long_text_mm39j0r4",
+      // PR-A2 (May 2026) — Active's Job Status (crew-facing lifecycle
+      // column). Active + Job Complete + Submitted share the same id
+      // (duplicate-board origin); Approved & Paid has its own.
+      jobStatus: "color_mm2tff18",
     },
   },
   jobComplete: {
@@ -157,18 +169,21 @@ const JOB_BOARDS: Record<
     cols: {
       ...ACTIVE_JOB_COL_IDS_BASE,
       disputeReason: "long_text_mm39yfxb",
+      jobStatus: "color_mm2tff18",
     },
   },
   cancelled: {
     id: CANCELLED_JOBS_BOARD,
     // Duplicated from Active 11 May 2026 — column IDs byte-identical
-    // for the base set. disputeReason intentionally null: the PR-A
-    // brief says "Don't propagate to the Cancelled Jobs board —
-    // disputes don't apply to cancelled work." Setting null here
-    // short-circuits the rollup before any read/write touches it.
+    // for the base set. disputeReason + jobStatus intentionally null:
+    // the PR briefs say "Don't propagate to the Cancelled Jobs board —
+    // disputes don't apply to cancelled work" (PR-A) and "Don't touch
+    // Job Status on cancelled work" (PR-A2). Null here short-circuits
+    // both rollups before any read/write touches them.
     cols: {
       ...ACTIVE_JOB_COL_IDS_BASE,
       disputeReason: null,
+      jobStatus: null,
     },
   },
   submitted: {
@@ -196,6 +211,9 @@ const JOB_BOARDS: Record<
       actualMetres: "numeric_mm2t9b8j",
       // PR-A (May 2026) — Submitted board's 🚨 Dispute Reason long_text.
       disputeReason: "long_text_mm39ps0q",
+      // PR-A2 (May 2026) — Submitted's Job Status. Same id as Active /
+      // Job Complete (duplicate-board origin).
+      jobStatus: "color_mm2tff18",
     },
   },
   approved: {
@@ -227,8 +245,50 @@ const JOB_BOARDS: Record<
       actualMetres: "numeric_mm32ak31",
       // PR-A (May 2026) — Approved board's 🚨 Dispute Reason long_text.
       disputeReason: "long_text_mm39sbmy",
+      // PR-A2 (May 2026) — Approved's Job Status has its own id
+      // (separate schema from the duplicate-board cluster).
+      jobStatus: "color_mm329x8a",
     },
   },
+};
+
+/**
+ * PR-A2 (May 2026) — UGL Payment Status → Job Status mirror policy.
+ *
+ * KEY: raw UGL Payment Status label (matches lifecycle.aggregatedStatus
+ *      from fetchSorLifecycleByAsset, BEFORE the "Descoped"→"Cancelled"
+ *      transform applied at write time). The brief's keys are the raw
+ *      labels from sync_sor_extract.ts.
+ *
+ * VALUE:
+ *   - string → write this Job Status when the mirror fires
+ *   - null   → explicit "leave Job Status alone" (crew-owned phase)
+ *   - missing key → defensive same-as-null (don't write)
+ *
+ * The mirror ONLY fires when this run is actually writing a new UGL
+ * Payment Status (i.e. uglStatusChanged is true). Quiet runs don't
+ * touch Job Status — this protects crew-set lifecycle states from
+ * being clobbered. Null entries also gate the write: even if UGL
+ * status changes to e.g. "Pending Construction", we don't override
+ * the crew's Job Status (because that's a crew-owned phase by policy).
+ */
+const UGL_TO_JOB_STATUS: Record<string, string | null> = {
+  // Pre-submission states — crew owns these phases, leave Job Status alone
+  "Pending Construction": null,
+  "Not Started": null,
+  // Submitted family — UGL has it, awaiting their verdict
+  "In Review": "Submitted to UGL",
+  "Pending Artefacts": "Submitted to UGL",
+  // Approved family
+  "Approved": "Approved",
+  // Paid family — all roads lead to Paid for crew's purposes
+  "Paid": "Paid",
+  "Paid - Pending RCTI": "Paid",
+  "Partial Paid": "Paid",
+  "Overpaid": "Paid",
+  // Negative outcomes
+  "Disputed": "Rejected",
+  "Descoped": "Cancelled",
 };
 
 /** SOR Lines source columns (read-only). */
@@ -1156,6 +1216,21 @@ interface JobItem {
    *  write fired (idempotent re-runs report 0 writes but the same
    *  disputed count). */
   disputedSorLines: number;
+  /** Current Job Status (the crew-facing lifecycle column). null when
+   *  this board has no jobStatus column (Cancelled). */
+  currentJobStatus: string | null;
+  /** PR-A2 — Desired Job Status from the UGL → Job Status mirror
+   *  policy. null when (a) UGL Payment Status isn't being written this
+   *  run, (b) the row is on a board without jobStatus (Cancelled), or
+   *  (c) the policy table maps the raw UGL status to null/missing
+   *  (crew-owned phase like "Pending Construction"). */
+  desiredJobStatus: string | null;
+  /** PR-A2 — true when the mirror would fire (UGL changing + policy
+   *  has a target) but the current Job Status already matches the
+   *  target → no write needed. Counted for the audit log to show
+   *  idempotent skips ("already correct" — distinct from "no policy"
+   *  which is too noisy to log). */
+  jobStatusMirrorSkipped: boolean;
   isTest: boolean;
   unmatchedAsset: boolean;
 }
@@ -1171,6 +1246,8 @@ type JobItemRaw = Omit<
   | "desiredActualMetres"
   | "desiredDisputeReason"
   | "disputedSorLines"
+  | "desiredJobStatus"
+  | "jobStatusMirrorSkipped"
   | "isTest"
   | "unmatchedAsset"
 >;
@@ -1198,6 +1275,10 @@ async function fetchJobBoardItems(
     // (no propagation per brief). Spread conditionally so the query
     // doesn't ask for a column that doesn't exist.
     ...(board.cols.disputeReason ? [board.cols.disputeReason] : []),
+    // PR-A2 (May 2026) — jobStatus is null on Cancelled per brief
+    // ("don't touch Job Status on cancelled work"). Same conditional
+    // spread.
+    ...(board.cols.jobStatus ? [board.cols.jobStatus] : []),
   ];
   const out: JobItemRaw[] = [];
   let cursor: string | null = null;
@@ -1284,6 +1365,11 @@ async function fetchJobBoardItems(
       const currentDisputeReason = board.cols.disputeReason
         ? cv[board.cols.disputeReason]?.text?.trim() || null
         : null;
+      // Job Status — same null-when-no-column shape as Dispute
+      // Reason. Cancelled board → null short-circuits the mirror.
+      const currentJobStatus = board.cols.jobStatus
+        ? cv[board.cols.jobStatus]?.text?.trim() || null
+        : null;
       out.push({
         boardKey,
         boardId: board.id,
@@ -1306,6 +1392,7 @@ async function fetchJobBoardItems(
         currentDesignMetres,
         currentActualMetres,
         currentDisputeReason,
+        currentJobStatus,
       });
     }
     if (!page.cursor) break;
@@ -1386,6 +1473,41 @@ function buildPlan(
     : [];
   const desiredDisputeReason =
     disputes.length > 0 ? formatDisputeReason(disputes) : null;
+  // PR-A2 — UGL Payment Status → Job Status mirror. Only fires when
+  // ALL three conditions hold:
+  //   1. desiredUglPaymentStatus is non-null AND differs from
+  //      currentUglPaymentStatus (i.e. THIS run is actually changing
+  //      UGL Payment Status — protects crew-set Job Status during
+  //      quiet runs per brief)
+  //   2. raw.cols.jobStatus is non-null (i.e. not the Cancelled board)
+  //   3. UGL_TO_JOB_STATUS maps the raw aggregatedStatus to a string
+  //      (not null, not missing — crew-owned phases like "Pending
+  //      Construction" map to null and are protected)
+  //
+  // Policy lookup uses lifecycle.aggregatedStatus (raw, pre-transform)
+  // rather than desiredUglPaymentStatus (post-Descoped→Cancelled
+  // transform) so the policy keys match the brief's table verbatim.
+  const uglStatusChanged =
+    desiredUglPaymentStatus != null &&
+    desiredUglPaymentStatus !== raw.currentUglPaymentStatus;
+  let desiredJobStatus: string | null = null;
+  let jobStatusMirrorSkipped = false;
+  if (uglStatusChanged && raw.cols.jobStatus && lifecycle.aggregatedStatus) {
+    const mapped = UGL_TO_JOB_STATUS[lifecycle.aggregatedStatus];
+    if (mapped !== undefined && mapped !== null) {
+      if (mapped === raw.currentJobStatus) {
+        // Mirror would fire but the target already matches → idempotent
+        // skip. Counted in the audit log but doesn't generate a write.
+        jobStatusMirrorSkipped = true;
+      } else {
+        desiredJobStatus = mapped;
+      }
+    }
+    // null / missing in the policy table → leave Job Status alone
+    // (crew-owned phase). Not counted as "skipped" — that label is
+    // reserved for "would have fired but no-op"; "no policy" is too
+    // noisy to log.
+  }
   return {
     ...raw,
     isTest,
@@ -1399,6 +1521,8 @@ function buildPlan(
     desiredActualMetres,
     desiredDisputeReason,
     disputedSorLines: disputes.length,
+    desiredJobStatus,
+    jobStatusMirrorSkipped,
   };
 }
 
@@ -1410,6 +1534,7 @@ function planNeedsWrite(p: JobItem): {
   designMetres: boolean;
   actualMetres: boolean;
   disputeReason: boolean;
+  jobStatusMirror: boolean;
 } {
   const wantPrimary = p.desiredPrimary != null;
   const havePrimary = p.currentPrimary.length === 1 && p.currentPrimary[0] === p.desiredPrimary;
@@ -1464,6 +1589,11 @@ function planNeedsWrite(p: JobItem): {
   const disputeReason =
     p.desiredDisputeReason != null &&
     p.desiredDisputeReason !== (p.currentDisputeReason ?? "");
+  // PR-A2 — Job Status mirror. desiredJobStatus is non-null only when
+  // buildPlan determined the mirror should fire (all 3 gates passed)
+  // AND the target differs from current (idempotent skips are tracked
+  // separately via jobStatusMirrorSkipped, not surfaced as a write).
+  const jobStatusMirror = p.desiredJobStatus != null;
   return {
     primary,
     revenue,
@@ -1472,6 +1602,7 @@ function planNeedsWrite(p: JobItem): {
     designMetres,
     actualMetres,
     disputeReason,
+    jobStatusMirror,
   };
 }
 
@@ -1506,6 +1637,17 @@ interface ApplyResult {
    *  of whether the dispute-reason write fired this run. Always
    *  reflects the source of truth, idempotent across re-runs. */
   disputedCount: number;
+  /** PR-A2 (May 2026) — items whose Job Status was mirrored from UGL
+   *  Payment Status this run. Gated on (a) UGL actually changing this
+   *  run, (b) policy mapping the raw UGL status to a non-null target,
+   *  and (c) current Job Status differing from the target. */
+  jobStatusMirrorWrites: number;
+  /** PR-A2 — items where the mirror would have fired (UGL changed +
+   *  policy has a non-null target) but the current Job Status already
+   *  matched the target. Logged separately so the audit trail shows
+   *  the difference between "no policy" (silent) and "policy says X
+   *  but already X" (skipped — visible). */
+  jobStatusMirrorSkipped: number;
   unchanged: number;
   testItems: number;
   unmatchedItems: number;
@@ -1530,6 +1672,12 @@ async function applyForBoard(
     // computed up front so the audit log can report "disputed: M"
     // even when writes are 0 (steady state on a re-run).
     disputedCount: plans.filter((p) => p.disputedSorLines > 0).length,
+    jobStatusMirrorWrites: 0,
+    // Pre-computed from plan flags (set by buildPlan when the mirror
+    // would fire but current already matched). Same idempotency
+    // contract as disputedCount — surfaces in the audit log on
+    // every run, not just runs that wrote.
+    jobStatusMirrorSkipped: plans.filter((p) => p.jobStatusMirrorSkipped).length,
     unchanged: 0,
     testItems: plans.filter((p) => p.isTest).length,
     unmatchedItems: plans.filter((p) => p.unmatchedAsset).length,
@@ -1547,6 +1695,7 @@ async function applyForBoard(
       designMetres: boolean;
       actualMetres: boolean;
       disputeReason: boolean;
+      jobStatusMirror: boolean;
     };
   }> = [];
   for (const p of plans) {
@@ -1558,7 +1707,8 @@ async function applyForBoard(
       !needs.lifecycle &&
       !needs.designMetres &&
       !needs.actualMetres &&
-      !needs.disputeReason
+      !needs.disputeReason &&
+      !needs.jobStatusMirror
     ) {
       result.unchanged += 1;
       continue;
@@ -1570,6 +1720,7 @@ async function applyForBoard(
     if (needs.designMetres) result.designMetresWrites += 1;
     if (needs.actualMetres) result.actualMetresWrites += 1;
     if (needs.disputeReason) result.disputeReasonWrites += 1;
+    if (needs.jobStatusMirror) result.jobStatusMirrorWrites += 1;
     writes.push({ plan: p, needs });
   }
   if (dryRun) return result;
@@ -1635,6 +1786,19 @@ async function applyForBoard(
         // here guarantee we never clear via this write (write-only,
         // per PR-A's "Don't clear a manually-set value" rule).
         colValues[w.plan.cols.disputeReason] = w.plan.desiredDisputeReason;
+      }
+      if (
+        w.needs.jobStatusMirror &&
+        w.plan.desiredJobStatus != null &&
+        w.plan.cols.jobStatus
+      ) {
+        // Status (color) column — monday's create_labels_if_missing
+        // is true on the surrounding mutation so an unknown label
+        // would be created if needed; however the policy table only
+        // ever maps to the 5 canonical Job Status labels which all
+        // pre-exist on the board ("Submitted to UGL", "Approved",
+        // "Paid", "Rejected", "Cancelled").
+        colValues[w.plan.cols.jobStatus] = { label: w.plan.desiredJobStatus };
       }
       aliases.push(
         `m${j}: change_multiple_column_values(
@@ -1776,11 +1940,11 @@ export async function runSyncJobData(
   const cancelled = await applyForBoard(cancelledPlans, dryRun);
 
   const totalWrites =
-    active.primaryWrites + active.revenueWrites + active.photoWrites + active.lifecycleWrites + active.designMetresWrites + active.actualMetresWrites + active.disputeReasonWrites +
-    jobComplete.primaryWrites + jobComplete.revenueWrites + jobComplete.photoWrites + jobComplete.lifecycleWrites + jobComplete.designMetresWrites + jobComplete.actualMetresWrites + jobComplete.disputeReasonWrites +
-    submitted.primaryWrites + submitted.revenueWrites + submitted.photoWrites + submitted.lifecycleWrites + submitted.designMetresWrites + submitted.actualMetresWrites + submitted.disputeReasonWrites +
-    approved.primaryWrites + approved.revenueWrites + approved.photoWrites + approved.lifecycleWrites + approved.designMetresWrites + approved.actualMetresWrites + approved.disputeReasonWrites +
-    cancelled.primaryWrites + cancelled.revenueWrites + cancelled.photoWrites + cancelled.lifecycleWrites + cancelled.designMetresWrites + cancelled.actualMetresWrites + cancelled.disputeReasonWrites;
+    active.primaryWrites + active.revenueWrites + active.photoWrites + active.lifecycleWrites + active.designMetresWrites + active.actualMetresWrites + active.disputeReasonWrites + active.jobStatusMirrorWrites +
+    jobComplete.primaryWrites + jobComplete.revenueWrites + jobComplete.photoWrites + jobComplete.lifecycleWrites + jobComplete.designMetresWrites + jobComplete.actualMetresWrites + jobComplete.disputeReasonWrites + jobComplete.jobStatusMirrorWrites +
+    submitted.primaryWrites + submitted.revenueWrites + submitted.photoWrites + submitted.lifecycleWrites + submitted.designMetresWrites + submitted.actualMetresWrites + submitted.disputeReasonWrites + submitted.jobStatusMirrorWrites +
+    approved.primaryWrites + approved.revenueWrites + approved.photoWrites + approved.lifecycleWrites + approved.designMetresWrites + approved.actualMetresWrites + approved.disputeReasonWrites + approved.jobStatusMirrorWrites +
+    cancelled.primaryWrites + cancelled.revenueWrites + cancelled.photoWrites + cancelled.lifecycleWrites + cancelled.designMetresWrites + cancelled.actualMetresWrites + cancelled.disputeReasonWrites + cancelled.jobStatusMirrorWrites;
   const totalFailed =
     active.failed + jobComplete.failed + submitted.failed + approved.failed + cancelled.failed;
 
