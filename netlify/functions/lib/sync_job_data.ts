@@ -80,6 +80,14 @@ interface JobBoardCols {
   // writes; the UPDATE path now keeps them in sync after status moves.
   rcti: string;
   uglPaymentStatus: string;
+  // Design Metres — May 2026 fix. Field app's "missing Design Metres"
+  // warning was firing on ~650 of 657 rows because nothing populated
+  // this column. import_work_orders' CREATE path never wrote it; sync
+  // _job_data's UPDATE path never wrote it. Now both do, conditional
+  // on the SOR line's UOM matching `metre/meter` (so non-metres jobs
+  // like pit-installs stay null — they're not measured in metres).
+  // active-cluster: numeric_mm2te6g2 ; approved: numeric_mm3233b7.
+  designMetres: string;
 }
 
 /**
@@ -107,6 +115,7 @@ const ACTIVE_JOB_COL_IDS: JobBoardCols = {
   // schema). Approved & Paid has its own ids — see below.
   rcti: "text_mm2tdrdk",
   uglPaymentStatus: "color_mm32x3ga",
+  designMetres: "numeric_mm2te6g2",
 };
 
 const JOB_BOARDS: Record<
@@ -144,6 +153,10 @@ const JOB_BOARDS: Record<
       // origin; only the 6 SOR-revenue numerics drift per comment above).
       rcti: "text_mm2tdrdk",
       uglPaymentStatus: "color_mm32x3ga",
+      // Submitted board's Design Metres shares Active's id (duplicate-board
+      // schema; the per-status revenue numerics are the only Phase-Ca-
+      // added columns that drift on this board).
+      designMetres: "numeric_mm2te6g2",
     },
   },
   approved: {
@@ -164,6 +177,10 @@ const JOB_BOARDS: Record<
       // import_work_orders.ts) — different RCTI + status column IDs.
       rcti: "text_mm32c4fj",
       uglPaymentStatus: "color_mm322s90",
+      // Approved's Design Metres column has its own id (board was
+      // not duplicated from Active; columns named identically but
+      // with different ids per board metadata).
+      designMetres: "numeric_mm3233b7",
     },
   },
 };
@@ -185,6 +202,16 @@ const SOR_COLS = {
   // create-time snapshot.
   uglStatus: "color_mm2tavfn",
   invoiceNo: "text_mm2t3sb5",
+  // Design Metres propagation (May 2026 field-app fix). SOR Lines
+  // stores Design Qty per line plus the UOM string ("Per linear metre"
+  // / "Each ACM Pit" / etc). We sum design_qty over the metres-UOM
+  // lines per asset and write the total to Design Metres on the job
+  // boards. Non-metres lines (pit installs, link-ups, lid replacements)
+  // contribute nothing — their Design Metres stays null on the job
+  // board, which is the correct semantic since they're counted by
+  // "each", not measured in metres.
+  designQty: "numeric_mm2teaw2",
+  uom: "text_mm2thydc",
 } as const;
 
 /**
@@ -432,6 +459,104 @@ async function fetchSorLifecycleByAsset(): Promise<Map<string, Lifecycle>> {
       rctiNumber: aggRcti.get(asset) ?? null,
     });
   }
+  return byAsset;
+}
+
+// ============================================================================
+// Design Metres propagation (May 2026 field-app fix).
+//
+// SOR Lines source columns: numeric_mm2teaw2 (Design Qty) +
+// text_mm2thydc (Unit of Measure). Each asset has one or more SOR
+// lines; only the lines whose UOM string is metres-like contribute
+// to the job-board "Design Metres" value. Non-metres lines (pit
+// installs, lid replacements, etc) stay out of the sum entirely —
+// their Design Metres value on the job board stays null, which is
+// the correct semantic (those jobs aren't measured in metres).
+//
+// Real-world UOM values observed on SOR Lines (sampled May 12):
+//   "Per linear metre"  ← metres-like
+//   "Each ACM Pit"
+//   "Each core bore"
+//   "Each Pit"
+//   "Each pit lids"
+//
+// The whole-word regex `/\b(metre|meter)s?\b/` matches "Per linear
+// metre" without false-positives on "metric"/"metropolitan". Bare
+// "m" / "per m" / "/m" are caught as separate fallbacks for future
+// UOM-string variants.
+// ============================================================================
+
+/** Whole-word match on "metre"/"meter" + a few common short forms.
+ *  Returns true when the UOM string indicates the line is measured
+ *  in metres; false otherwise (including for null/empty input). */
+export function isMetresUOM(uom: string | null | undefined): boolean {
+  if (!uom) return false;
+  const s = uom.toLowerCase().trim();
+  if (s === "m") return true;
+  if (/\b(metre|meter)s?\b/.test(s)) return true;
+  if (/^per\s+m\b/.test(s)) return true;
+  if (/^\/m\b/.test(s)) return true;
+  return false;
+}
+
+/** Per-asset sum of design_qty across SOR lines whose UOM is metres-
+ *  like. Returns a Map<asset, totalMetres>. Assets with NO metres-UOM
+ *  lines are absent from the map (NOT a 0 entry) — caller treats
+ *  absence as "no Design Metres value to write". */
+async function fetchSorDesignMetresByAsset(): Promise<Map<string, number>> {
+  const cols = [SOR_COLS.assetText, SOR_COLS.designQty, SOR_COLS.uom];
+  type RawCol = { id: string; text: string | null };
+  type RawItem = { column_values: RawCol[] };
+  const byAsset = new Map<string, number>();
+  let cursor: string | null = null;
+  let pages = 0;
+  let rowsSeen = 0;
+  let metresLinesSeen = 0;
+  for (let pg = 1; pg <= 20; pg++) {
+    pages = pg;
+    const data = await monday<{
+      boards?: Array<{ items_page: { cursor: string | null; items: RawItem[] } }>;
+      next_items_page?: { cursor: string | null; items: RawItem[] };
+    }>(
+      cursor
+        ? `query ($cursor: String!, $col: [String!]) {
+            next_items_page(limit: 500, cursor: $cursor) {
+              cursor items { column_values(ids: $col) { id text } }
+            }
+          }`
+        : `query ($boardId: ID!, $col: [String!]) {
+            boards(ids: [$boardId]) {
+              items_page(limit: 500) {
+                cursor items { column_values(ids: $col) { id text } }
+              }
+            }
+          }`,
+      cursor ? { cursor, col: cols } : { boardId: String(SOR_LINES_BOARD), col: cols }
+    );
+    const page: { cursor: string | null; items: RawItem[] } = cursor
+      ? data.next_items_page!
+      : data.boards![0].items_page;
+    for (const it of page.items) {
+      rowsSeen += 1;
+      const cv: Record<string, RawCol> = {};
+      for (const c of it.column_values) cv[c.id] = c;
+      const asset = (cv[SOR_COLS.assetText]?.text ?? "").trim();
+      if (!asset) continue;
+      const uom = cv[SOR_COLS.uom]?.text ?? null;
+      if (!isMetresUOM(uom)) continue;
+      const qtyText = cv[SOR_COLS.designQty]?.text ?? null;
+      if (!qtyText) continue;
+      const qty = Number(qtyText.replace(/[^0-9.\-]/g, ""));
+      if (!Number.isFinite(qty)) continue;
+      metresLinesSeen += 1;
+      byAsset.set(asset, (byAsset.get(asset) ?? 0) + qty);
+    }
+    if (!page.cursor) break;
+    cursor = page.cursor;
+  }
+  console.log(
+    `[sync-job-data] fetchSorDesignMetresByAsset: ${rowsSeen} SOR Lines across ${pages} pages → ${metresLinesSeen} metres-UOM lines summed into ${byAsset.size} assets`
+  );
   return byAsset;
 }
 
@@ -775,6 +900,12 @@ interface JobItem {
   /** Desired UGL Payment Status from the SOR Lines roll-up. null = no write
    *  (defensive — only set when at least one SOR line has a status). */
   desiredUglPaymentStatus: string | null;
+  /** Current Design Metres column value (null when blank). */
+  currentDesignMetres: number | null;
+  /** Desired Design Metres — summed from SOR Lines whose UOM is
+   *  metres-like. null = no metres-UOM lines for this asset → don't
+   *  write (preserves null on non-metres jobs like pit installs). */
+  desiredDesignMetres: number | null;
   isTest: boolean;
   unmatchedAsset: boolean;
 }
@@ -786,6 +917,7 @@ type JobItemRaw = Omit<
   | "desiredPhotos"
   | "desiredRctiNumber"
   | "desiredUglPaymentStatus"
+  | "desiredDesignMetres"
   | "isTest"
   | "unmatchedAsset"
 >;
@@ -807,6 +939,7 @@ async function fetchJobBoardItems(
     ...(board.cols.photosTaken ? [board.cols.photosTaken] : []),
     board.cols.rcti,
     board.cols.uglPaymentStatus,
+    board.cols.designMetres,
   ];
   const out: JobItemRaw[] = [];
   let cursor: string | null = null;
@@ -859,6 +992,20 @@ async function fetchJobBoardItems(
           : null;
       const rctiText = cv[board.cols.rcti]?.text?.trim() || null;
       const statusText = cv[board.cols.uglPaymentStatus]?.text?.trim() || null;
+      // Design Metres: numeric column. Parse via the existing
+      // parseFormula helper (handles "" / null / non-numeric safely)
+      // but treat empty-string as null instead of 0 — the script's
+      // diff check needs to distinguish "row has no value" from
+      // "row has 0 metres" so we don't keep overwriting a deliberate
+      // zero with our desired-null.
+      const dmRaw = cv[board.cols.designMetres]?.text?.trim();
+      const currentDesignMetres =
+        dmRaw == null || dmRaw === ""
+          ? null
+          : (() => {
+              const n = Number(dmRaw.replace(/[^0-9.\-]/g, ""));
+              return Number.isFinite(n) ? n : null;
+            })();
       out.push({
         boardKey,
         boardId: board.id,
@@ -878,6 +1025,7 @@ async function fetchJobBoardItems(
         currentPhotos,
         currentRctiNumber: rctiText,
         currentUglPaymentStatus: statusText,
+        currentDesignMetres,
       });
     }
     if (!page.cursor) break;
@@ -901,7 +1049,8 @@ function buildPlan(
   sorByAsset: Map<string, Revenue>,
   sorMethodsByAsset: Map<string, SorMethodRow[]>,
   photosByAssetItemId: Map<string, PhotoRow[]>,
-  lifecycleByAsset: Map<string, Lifecycle>
+  lifecycleByAsset: Map<string, Lifecycle>,
+  designMetresByAsset: Map<string, number>
 ): JobItem {
   const isTest = isTestAssetText(raw.asset);
   const networkId = raw.asset ? network.get(raw.asset) ?? null : null;
@@ -927,6 +1076,12 @@ function buildPlan(
     lifecycle.aggregatedStatus === "Descoped"
       ? "Cancelled"
       : lifecycle.aggregatedStatus;
+  // Design Metres — undefined in the map means "no metres-UOM SOR
+  // lines for this asset", which we surface as null so planNeedsWrite
+  // knows not to write. We do NOT write a 0 in that case — the
+  // semantic of null on the job board is "this job isn't measured in
+  // metres" (e.g., pit installs), not "0 metres designed".
+  const desiredDesignMetres = designMetresByAsset.get(raw.asset) ?? null;
   return {
     ...raw,
     isTest,
@@ -936,6 +1091,7 @@ function buildPlan(
     desiredPhotos,
     desiredRctiNumber: lifecycle.rctiNumber,
     desiredUglPaymentStatus,
+    desiredDesignMetres,
   };
 }
 
@@ -944,6 +1100,7 @@ function planNeedsWrite(p: JobItem): {
   revenue: boolean;
   photos: boolean;
   lifecycle: boolean;
+  designMetres: boolean;
 } {
   const wantPrimary = p.desiredPrimary != null;
   const havePrimary = p.currentPrimary.length === 1 && p.currentPrimary[0] === p.desiredPrimary;
@@ -972,7 +1129,16 @@ function planNeedsWrite(p: JobItem): {
     p.desiredUglPaymentStatus != null &&
     p.desiredUglPaymentStatus !== p.currentUglPaymentStatus;
   const lifecycle = rctiChanged || statusChanged;
-  return { primary, revenue, photos, lifecycle };
+  // Design Metres: only write when we have a concrete desired value
+  // (i.e. at least one metres-UOM SOR line for this asset). null
+  // desired = "this job isn't metres-measured" → leave current value
+  // alone, even if current happens to be populated with stale data.
+  // Approx-equal check absorbs floating-point noise (e.g. 25.0 vs 25).
+  const designMetres =
+    p.desiredDesignMetres != null &&
+    (p.currentDesignMetres == null ||
+      !approxEqual(p.currentDesignMetres, p.desiredDesignMetres));
+  return { primary, revenue, photos, lifecycle, designMetres };
 }
 
 interface ApplyResult {
@@ -984,6 +1150,12 @@ interface ApplyResult {
    *  only — only counts assets whose desired value differed from the
    *  current monday value. Added in Track G3-fix4 (May 2026). */
   lifecycleWrites: number;
+  /** Items that had Design Metres written this run. Diff-only — only
+   *  counts assets with at least one metres-UOM SOR line AND whose
+   *  current Design Metres differs from the summed desired value.
+   *  Added in May 2026 to fix the field-app "missing Design Metres"
+   *  warning on metres-based jobs. */
+  designMetresWrites: number;
   unchanged: number;
   testItems: number;
   unmatchedItems: number;
@@ -1001,6 +1173,7 @@ async function applyForBoard(
     revenueWrites: 0,
     photoWrites: 0,
     lifecycleWrites: 0,
+    designMetresWrites: 0,
     unchanged: 0,
     testItems: plans.filter((p) => p.isTest).length,
     unmatchedItems: plans.filter((p) => p.unmatchedAsset).length,
@@ -1010,11 +1183,23 @@ async function applyForBoard(
 
   const writes: Array<{
     plan: JobItem;
-    needs: { primary: boolean; revenue: boolean; photos: boolean; lifecycle: boolean };
+    needs: {
+      primary: boolean;
+      revenue: boolean;
+      photos: boolean;
+      lifecycle: boolean;
+      designMetres: boolean;
+    };
   }> = [];
   for (const p of plans) {
     const needs = planNeedsWrite(p);
-    if (!needs.primary && !needs.revenue && !needs.photos && !needs.lifecycle) {
+    if (
+      !needs.primary &&
+      !needs.revenue &&
+      !needs.photos &&
+      !needs.lifecycle &&
+      !needs.designMetres
+    ) {
       result.unchanged += 1;
       continue;
     }
@@ -1022,6 +1207,7 @@ async function applyForBoard(
     if (needs.revenue) result.revenueWrites += 1;
     if (needs.photos) result.photoWrites += 1;
     if (needs.lifecycle) result.lifecycleWrites += 1;
+    if (needs.designMetres) result.designMetresWrites += 1;
     writes.push({ plan: p, needs });
   }
   if (dryRun) return result;
@@ -1066,6 +1252,10 @@ async function applyForBoard(
             label: w.plan.desiredUglPaymentStatus,
           };
         }
+      }
+      if (w.needs.designMetres && w.plan.desiredDesignMetres != null) {
+        // Numeric column write — monday accepts a JS number.
+        colValues[w.plan.cols.designMetres] = w.plan.desiredDesignMetres;
       }
       aliases.push(
         `m${j}: change_multiple_column_values(
@@ -1129,18 +1319,34 @@ export interface SyncJobDataResult {
   totalFailed: number;
 }
 
+export interface RunSyncJobDataOptions {
+  /** When true, plan but don't call monday's write mutations. Default
+   *  false. Worker invocations never pass this — they always go live.
+   *  CLI scripts (scripts/dry_run_design_propagation.ts etc) use this
+   *  for preview. */
+  dryRun?: boolean;
+}
+
 /**
  * Run the per-job data sync over Active + Job Complete + Submitted +
- * Approved boards. Always real (no dry-run path) — the worker invokes
- * this after a successful import. Idempotent: writes only what's
- * changed. Track K3 (May 2026): added Job Complete to the walk.
+ * Approved + Cancelled boards. Idempotent: writes only what's changed.
+ *
+ *  Track K3 (May 2026): added Job Complete to the walk.
+ *  Track G3-fix5 (11 May 2026): added Cancelled.
+ *  Design Metres fix (12 May 2026): added the SOR-Lines→job-board
+ *    Design Metres propagation. Also added the `opts.dryRun` knob so
+ *    CLI scripts can preview without writing.
  */
-export async function runSyncJobData(): Promise<SyncJobDataResult> {
+export async function runSyncJobData(
+  opts: RunSyncJobDataOptions = {}
+): Promise<SyncJobDataResult> {
   const start = Date.now();
+  const dryRun = opts.dryRun ?? false;
   const [
     sorByAsset,
     sorMethodsByAsset,
     lifecycleByAsset,
+    designMetresByAsset,
     networkIdx,
     photosByAssetItemId,
     activeRaw,
@@ -1152,6 +1358,7 @@ export async function runSyncJobData(): Promise<SyncJobDataResult> {
     fetchSorRevenueByAsset(),
     fetchSorMethodsByAsset(),
     fetchSorLifecycleByAsset(),
+    fetchSorDesignMetresByAsset(),
     fetchNetworkAssetIndex(),
     fetchPhotosByAssetItemId(),
     fetchJobBoardItems("active"),
@@ -1163,34 +1370,34 @@ export async function runSyncJobData(): Promise<SyncJobDataResult> {
   const network = networkIdx.byName;
 
   const activePlans = activeRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset)
   );
   const jobCompletePlans = jobCompleteRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset)
   );
   const submittedPlans = submittedRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset)
   );
   const approvedPlans = approvedRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset)
   );
   const cancelledPlans = cancelledRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset)
   );
 
   // Sequential to keep monday rate-limit pressure bounded.
-  const active = await applyForBoard(activePlans, false);
-  const jobComplete = await applyForBoard(jobCompletePlans, false);
-  const submitted = await applyForBoard(submittedPlans, false);
-  const approved = await applyForBoard(approvedPlans, false);
-  const cancelled = await applyForBoard(cancelledPlans, false);
+  const active = await applyForBoard(activePlans, dryRun);
+  const jobComplete = await applyForBoard(jobCompletePlans, dryRun);
+  const submitted = await applyForBoard(submittedPlans, dryRun);
+  const approved = await applyForBoard(approvedPlans, dryRun);
+  const cancelled = await applyForBoard(cancelledPlans, dryRun);
 
   const totalWrites =
-    active.primaryWrites + active.revenueWrites + active.photoWrites + active.lifecycleWrites +
-    jobComplete.primaryWrites + jobComplete.revenueWrites + jobComplete.photoWrites + jobComplete.lifecycleWrites +
-    submitted.primaryWrites + submitted.revenueWrites + submitted.photoWrites + submitted.lifecycleWrites +
-    approved.primaryWrites + approved.revenueWrites + approved.photoWrites + approved.lifecycleWrites +
-    cancelled.primaryWrites + cancelled.revenueWrites + cancelled.photoWrites + cancelled.lifecycleWrites;
+    active.primaryWrites + active.revenueWrites + active.photoWrites + active.lifecycleWrites + active.designMetresWrites +
+    jobComplete.primaryWrites + jobComplete.revenueWrites + jobComplete.photoWrites + jobComplete.lifecycleWrites + jobComplete.designMetresWrites +
+    submitted.primaryWrites + submitted.revenueWrites + submitted.photoWrites + submitted.lifecycleWrites + submitted.designMetresWrites +
+    approved.primaryWrites + approved.revenueWrites + approved.photoWrites + approved.lifecycleWrites + approved.designMetresWrites +
+    cancelled.primaryWrites + cancelled.revenueWrites + cancelled.photoWrites + cancelled.lifecycleWrites + cancelled.designMetresWrites;
   const totalFailed =
     active.failed + jobComplete.failed + submitted.failed + approved.failed + cancelled.failed;
 
