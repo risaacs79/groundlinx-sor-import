@@ -97,6 +97,12 @@ interface JobBoardCols {
   // Note Approved's formula column Revenue $ = Rate × Actual Metres
   // recomputes once this column is populated — useful tripwire.
   actualMetres: string;
+  // 🚨 Dispute Reason (PR-A, May 2026). long_text per-board column
+  // populated by the dispute-reason rollup. null on boards where
+  // the column doesn't exist (Cancelled — disputes don't apply to
+  // cancelled work, per the PR's "don't" list). Distinct per-board
+  // id because each board got its own column from monday.
+  disputeReason: string | null;
 }
 
 /**
@@ -108,7 +114,11 @@ interface JobBoardCols {
  * AFTER Phase Ca's revenue + photo columns landed on Active, so its
  * column IDs are byte-for-byte identical to Active.
  */
-const ACTIVE_JOB_COL_IDS: JobBoardCols = {
+/** Shared column ids across Active / Job Complete / Cancelled. The
+ *  per-board entries below spread this + override the disputeReason
+ *  field (which has a distinct id on each board because monday minted
+ *  unique ids when the column was added separately). */
+const ACTIVE_JOB_COL_IDS_BASE: Omit<JobBoardCols, "disputeReason"> = {
   asset: "text_mm2tmm57",
   primary: "board_relation_mm2tyedq",
   forecast: "numeric_mm341c4r",
@@ -134,17 +144,32 @@ const JOB_BOARDS: Record<
 > = {
   active: {
     id: ACTIVE_JOBS_BOARD,
-    cols: ACTIVE_JOB_COL_IDS,
+    cols: {
+      ...ACTIVE_JOB_COL_IDS_BASE,
+      // PR-A (May 2026) — Active board's 🚨 Dispute Reason long_text.
+      disputeReason: "long_text_mm39j0r4",
+    },
   },
   jobComplete: {
     id: JOB_COMPLETE_BOARD,
-    // Track K1 verification confirmed 57/57 column IDs match Active.
-    cols: ACTIVE_JOB_COL_IDS,
+    // Track K1 verification confirmed 57/57 column IDs match Active —
+    // except the new disputeReason column (added per board separately).
+    cols: {
+      ...ACTIVE_JOB_COL_IDS_BASE,
+      disputeReason: "long_text_mm39yfxb",
+    },
   },
   cancelled: {
     id: CANCELLED_JOBS_BOARD,
-    // Duplicated from Active 11 May 2026 — column IDs byte-identical.
-    cols: ACTIVE_JOB_COL_IDS,
+    // Duplicated from Active 11 May 2026 — column IDs byte-identical
+    // for the base set. disputeReason intentionally null: the PR-A
+    // brief says "Don't propagate to the Cancelled Jobs board —
+    // disputes don't apply to cancelled work." Setting null here
+    // short-circuits the rollup before any read/write touches it.
+    cols: {
+      ...ACTIVE_JOB_COL_IDS_BASE,
+      disputeReason: null,
+    },
   },
   submitted: {
     id: SUBMITTED_JOBS_BOARD,
@@ -169,6 +194,8 @@ const JOB_BOARDS: Record<
       designMetres: "numeric_mm2te6g2",
       // Actual Metres — same duplicate-board origin → shared id with Active.
       actualMetres: "numeric_mm2t9b8j",
+      // PR-A (May 2026) — Submitted board's 🚨 Dispute Reason long_text.
+      disputeReason: "long_text_mm39ps0q",
     },
   },
   approved: {
@@ -198,6 +225,8 @@ const JOB_BOARDS: Record<
       // numeric_mm32ak31 (Rate × Actual Metres), so populating this
       // column will cause Revenue $ to recompute downstream.
       actualMetres: "numeric_mm32ak31",
+      // PR-A (May 2026) — Approved board's 🚨 Dispute Reason long_text.
+      disputeReason: "long_text_mm39sbmy",
     },
   },
 };
@@ -235,6 +264,14 @@ const SOR_COLS = {
   // Metres. Same metres-UOM rule as Design Metres; same per-asset
   // sum. Distinct from Design Metres which is the planned figure.
   actualQty: "numeric_mm2tb16d",
+  // Dispute Reason propagation (PR-A, May 2026). When SOR Status =
+  // "Disputed", the VA's free-text rationale lives on SOR Lines'
+  // VA_COMMENTS column (the xlsx parser writes it via
+  // sync_sor_extract.ts → COLUMN.VA_COMMENTS). This sync rolls it up
+  // per asset to the matching job row's 🚨 Dispute Reason column
+  // (different id per board — see JOB_BOARDS.disputeReason). Single
+  // disputed line → raw vaComments; multiple → labelled aggregate.
+  vaComments: "long_text_mm304kjb",
 } as const;
 
 /**
@@ -610,6 +647,113 @@ async function fetchSorDesignMetresByAsset(): Promise<Map<string, number>> {
  *  metres-UOM line" → caller skips the write (preserves null). */
 async function fetchSorActualMetresByAsset(): Promise<Map<string, number>> {
   return fetchSorMetresSumByAsset(SOR_COLS.actualQty, "Actual");
+}
+
+// ============================================================================
+// Dispute Reason propagation (PR-A, May 2026).
+//
+// SOR Lines stores per-line UGL Status (color_mm2tavfn — labelled
+// "SOR Status" in the xlsx pipeline) + a free-text VA Comments
+// long_text (long_text_mm304kjb). When UGL flags an SOR as "Disputed",
+// the VA writes the rationale into VA Comments. The crew needs to see
+// that reason on the job row's 🚨 Dispute Reason column without
+// drilling into SOR Lines.
+//
+// Rollup rules:
+//   - One disputed line for the asset → write its VA Comments verbatim.
+//   - Multiple disputed lines for the asset → write a bulleted aggregate
+//     "Multiple SOR lines disputed:\n- [code]: ..." so the crew can see
+//     which lines + why.
+//   - Zero disputed lines → don't write. Don't clear either. The PR's
+//     "Don't clear a manually-set Dispute Reason value" rule wins:
+//     stale text sits until either a new dispute overwrites it or
+//     someone manually clears it. Sync can't distinguish manual from
+//     sync-set without provenance tracking, so we err on the side of
+//     not destroying field input.
+// ============================================================================
+
+/** One disputed SOR line's contribution to its asset's dispute summary. */
+interface DisputeInfo {
+  sorCode: string | null;
+  vaComments: string;
+}
+
+async function fetchSorDisputesByAsset(): Promise<Map<string, DisputeInfo[]>> {
+  const cols = [
+    SOR_COLS.assetText,
+    SOR_COLS.itemCode,
+    SOR_COLS.uglStatus,
+    SOR_COLS.vaComments,
+  ];
+  type RawCol = { id: string; text: string | null };
+  type RawItem = { column_values: RawCol[] };
+  const byAsset = new Map<string, DisputeInfo[]>();
+  let cursor: string | null = null;
+  let pages = 0;
+  let rowsSeen = 0;
+  let disputedLines = 0;
+  for (let pg = 1; pg <= 20; pg++) {
+    pages = pg;
+    const data = await monday<{
+      boards?: Array<{ items_page: { cursor: string | null; items: RawItem[] } }>;
+      next_items_page?: { cursor: string | null; items: RawItem[] };
+    }>(
+      cursor
+        ? `query ($cursor: String!, $col: [String!]) {
+            next_items_page(limit: 500, cursor: $cursor) {
+              cursor items { column_values(ids: $col) { id text } }
+            }
+          }`
+        : `query ($boardId: ID!, $col: [String!]) {
+            boards(ids: [$boardId]) {
+              items_page(limit: 500) {
+                cursor items { column_values(ids: $col) { id text } }
+              }
+            }
+          }`,
+      cursor ? { cursor, col: cols } : { boardId: String(SOR_LINES_BOARD), col: cols }
+    );
+    const page: { cursor: string | null; items: RawItem[] } = cursor
+      ? data.next_items_page!
+      : data.boards![0].items_page;
+    for (const it of page.items) {
+      rowsSeen += 1;
+      const cv: Record<string, RawCol> = {};
+      for (const c of it.column_values) cv[c.id] = c;
+      const asset = (cv[SOR_COLS.assetText]?.text ?? "").trim();
+      if (!asset) continue;
+      const status = cv[SOR_COLS.uglStatus]?.text?.trim() ?? "";
+      if (status !== "Disputed") continue;
+      const vaComments = (cv[SOR_COLS.vaComments]?.text ?? "").trim();
+      if (!vaComments) continue;
+      const sorCode = cv[SOR_COLS.itemCode]?.text?.trim() || null;
+      disputedLines += 1;
+      const list = byAsset.get(asset);
+      if (list) list.push({ sorCode, vaComments });
+      else byAsset.set(asset, [{ sorCode, vaComments }]);
+    }
+    if (!page.cursor) break;
+    cursor = page.cursor;
+  }
+  console.log(
+    `[sync-job-data] fetchSorDisputesByAsset: ${rowsSeen} SOR Lines across ${pages} pages → ${disputedLines} disputed lines (status=Disputed AND vaComments non-empty) across ${byAsset.size} assets`
+  );
+  return byAsset;
+}
+
+/** Format the per-asset dispute summary written to the job board's
+ *  🚨 Dispute Reason column. Single line → verbatim; multiple →
+ *  bulleted aggregate with the SOR code as a prefix so the crew can
+ *  see which lines + why. */
+function formatDisputeReason(disputes: DisputeInfo[]): string {
+  if (disputes.length === 1) {
+    return disputes[0].vaComments;
+  }
+  const lines = disputes.map((d) => {
+    const code = d.sorCode ? `[${d.sorCode}]` : "[?]";
+    return `- ${code}: ${d.vaComments}`;
+  });
+  return `Multiple SOR lines disputed:\n${lines.join("\n")}`;
 }
 
 // ============================================================================
@@ -995,6 +1139,23 @@ interface JobItem {
    *  either no metres-UOM lines, or no actual data yet, or row's
    *  effective status is pre-submission → don't write. */
   desiredActualMetres: number | null;
+  /** Current 🚨 Dispute Reason text (null when blank, or when this
+   *  board has no disputeReason column — Cancelled). */
+  currentDisputeReason: string | null;
+  /** Desired Dispute Reason from the SOR Lines roll-up. null = no
+   *  disputed lines for this asset → DON'T write AND don't clear
+   *  (PR-A's "Don't clear a manually-set value" rule). The sync
+   *  can't distinguish manual edits from sync-set values without
+   *  provenance tracking, so we err on the side of preserving
+   *  whatever's there. */
+  desiredDisputeReason: string | null;
+  /** Number of disputed SOR lines this asset has (uglStatus=Disputed
+   *  AND non-empty vaComments). Used for the worker's per-board
+   *  audit-log breakdown — `disputed: M` reports how many job rows
+   *  on this board had ≥1 disputed line, regardless of whether the
+   *  write fired (idempotent re-runs report 0 writes but the same
+   *  disputed count). */
+  disputedSorLines: number;
   isTest: boolean;
   unmatchedAsset: boolean;
 }
@@ -1008,6 +1169,8 @@ type JobItemRaw = Omit<
   | "desiredUglPaymentStatus"
   | "desiredDesignMetres"
   | "desiredActualMetres"
+  | "desiredDisputeReason"
+  | "disputedSorLines"
   | "isTest"
   | "unmatchedAsset"
 >;
@@ -1031,6 +1194,10 @@ async function fetchJobBoardItems(
     board.cols.uglPaymentStatus,
     board.cols.designMetres,
     board.cols.actualMetres,
+    // PR-A (May 2026) — disputeReason is null on the Cancelled board
+    // (no propagation per brief). Spread conditionally so the query
+    // doesn't ask for a column that doesn't exist.
+    ...(board.cols.disputeReason ? [board.cols.disputeReason] : []),
   ];
   const out: JobItemRaw[] = [];
   let cursor: string | null = null;
@@ -1108,6 +1275,15 @@ async function fetchJobBoardItems(
               const n = Number(amRaw.replace(/[^0-9.\-]/g, ""));
               return Number.isFinite(n) ? n : null;
             })();
+      // 🚨 Dispute Reason — null on boards without the column
+      // (Cancelled). When the column exists, read its text; empty
+      // becomes null so the diff check distinguishes "unset" from
+      // "deliberate empty" (the latter wouldn't be a sync-write
+      // anyway, but the null-vs-empty contract stays consistent
+      // with currentDesignMetres + currentActualMetres above).
+      const currentDisputeReason = board.cols.disputeReason
+        ? cv[board.cols.disputeReason]?.text?.trim() || null
+        : null;
       out.push({
         boardKey,
         boardId: board.id,
@@ -1129,6 +1305,7 @@ async function fetchJobBoardItems(
         currentUglPaymentStatus: statusText,
         currentDesignMetres,
         currentActualMetres,
+        currentDisputeReason,
       });
     }
     if (!page.cursor) break;
@@ -1154,7 +1331,8 @@ function buildPlan(
   photosByAssetItemId: Map<string, PhotoRow[]>,
   lifecycleByAsset: Map<string, Lifecycle>,
   designMetresByAsset: Map<string, number>,
-  actualMetresByAsset: Map<string, number>
+  actualMetresByAsset: Map<string, number>,
+  disputesByAsset: Map<string, DisputeInfo[]>
 ): JobItem {
   const isTest = isTestAssetText(raw.asset);
   const networkId = raw.asset ? network.get(raw.asset) ?? null : null;
@@ -1198,6 +1376,16 @@ function buildPlan(
   const desiredActualMetres = inActualScope
     ? actualMetresByAsset.get(raw.asset) ?? null
     : null;
+  // PR-A — Dispute Reason rollup. Only fires on boards with a
+  // disputeReason column (i.e. not Cancelled — JobBoardCols.disputeReason
+  // is null there, so we skip even reading the map for those rows).
+  // No disputed lines for the asset → desiredDisputeReason stays null
+  // → planNeedsWrite skips (write-only, no auto-clear per PR brief).
+  const disputes = raw.cols.disputeReason
+    ? disputesByAsset.get(raw.asset) ?? []
+    : [];
+  const desiredDisputeReason =
+    disputes.length > 0 ? formatDisputeReason(disputes) : null;
   return {
     ...raw,
     isTest,
@@ -1209,6 +1397,8 @@ function buildPlan(
     desiredUglPaymentStatus,
     desiredDesignMetres,
     desiredActualMetres,
+    desiredDisputeReason,
+    disputedSorLines: disputes.length,
   };
 }
 
@@ -1219,6 +1409,7 @@ function planNeedsWrite(p: JobItem): {
   lifecycle: boolean;
   designMetres: boolean;
   actualMetres: boolean;
+  disputeReason: boolean;
 } {
   const wantPrimary = p.desiredPrimary != null;
   const havePrimary = p.currentPrimary.length === 1 && p.currentPrimary[0] === p.desiredPrimary;
@@ -1265,7 +1456,23 @@ function planNeedsWrite(p: JobItem): {
     p.desiredActualMetres != null &&
     (p.currentActualMetres == null ||
       !approxEqual(p.currentActualMetres, p.desiredActualMetres));
-  return { primary, revenue, photos, lifecycle, designMetres, actualMetres };
+  // PR-A — Dispute Reason: write-only, no auto-clear. Fires when there
+  // ARE disputed lines AND the rollup text differs from the current
+  // value. When desiredDisputeReason is null (no disputed lines), we
+  // never clear — leaves any manual or sync-set text alone (the
+  // "Treat manual edits as authoritative" rule from the PR brief).
+  const disputeReason =
+    p.desiredDisputeReason != null &&
+    p.desiredDisputeReason !== (p.currentDisputeReason ?? "");
+  return {
+    primary,
+    revenue,
+    photos,
+    lifecycle,
+    designMetres,
+    actualMetres,
+    disputeReason,
+  };
 }
 
 interface ApplyResult {
@@ -1290,6 +1497,15 @@ interface ApplyResult {
    *  from the summed desired value. Added in May 2026 (Bug C) to
    *  unlock design-vs-actual variance reporting per swing/crew/project. */
   actualMetresWrites: number;
+  /** PR-A (May 2026) — items whose 🚨 Dispute Reason text was
+   *  written this run. Write-only by design (never clears stale text);
+   *  in steady state this is 0. Surfaces in the per-board audit log. */
+  disputeReasonWrites: number;
+  /** Per-board count of job rows whose asset had ≥ 1 disputed SOR
+   *  line (uglStatus=Disputed AND non-empty vaComments), regardless
+   *  of whether the dispute-reason write fired this run. Always
+   *  reflects the source of truth, idempotent across re-runs. */
+  disputedCount: number;
   unchanged: number;
   testItems: number;
   unmatchedItems: number;
@@ -1309,6 +1525,11 @@ async function applyForBoard(
     lifecycleWrites: 0,
     designMetresWrites: 0,
     actualMetresWrites: 0,
+    disputeReasonWrites: 0,
+    // Aggregate of disputedSorLines>0 across the board's rows —
+    // computed up front so the audit log can report "disputed: M"
+    // even when writes are 0 (steady state on a re-run).
+    disputedCount: plans.filter((p) => p.disputedSorLines > 0).length,
     unchanged: 0,
     testItems: plans.filter((p) => p.isTest).length,
     unmatchedItems: plans.filter((p) => p.unmatchedAsset).length,
@@ -1325,6 +1546,7 @@ async function applyForBoard(
       lifecycle: boolean;
       designMetres: boolean;
       actualMetres: boolean;
+      disputeReason: boolean;
     };
   }> = [];
   for (const p of plans) {
@@ -1335,7 +1557,8 @@ async function applyForBoard(
       !needs.photos &&
       !needs.lifecycle &&
       !needs.designMetres &&
-      !needs.actualMetres
+      !needs.actualMetres &&
+      !needs.disputeReason
     ) {
       result.unchanged += 1;
       continue;
@@ -1346,6 +1569,7 @@ async function applyForBoard(
     if (needs.lifecycle) result.lifecycleWrites += 1;
     if (needs.designMetres) result.designMetresWrites += 1;
     if (needs.actualMetres) result.actualMetresWrites += 1;
+    if (needs.disputeReason) result.disputeReasonWrites += 1;
     writes.push({ plan: p, needs });
   }
   if (dryRun) return result;
@@ -1400,6 +1624,17 @@ async function applyForBoard(
         // planNeedsWrite guarantees we never overwrite null with null
         // or push the same value twice.
         colValues[w.plan.cols.actualMetres] = w.plan.desiredActualMetres;
+      }
+      if (
+        w.needs.disputeReason &&
+        w.plan.desiredDisputeReason != null &&
+        w.plan.cols.disputeReason
+      ) {
+        // long_text column write — monday accepts a plain string. The
+        // diff in planNeedsWrite + the desiredDisputeReason null-check
+        // here guarantee we never clear via this write (write-only,
+        // per PR-A's "Don't clear a manually-set value" rule).
+        colValues[w.plan.cols.disputeReason] = w.plan.desiredDisputeReason;
       }
       aliases.push(
         `m${j}: change_multiple_column_values(
@@ -1492,6 +1727,7 @@ export async function runSyncJobData(
     lifecycleByAsset,
     designMetresByAsset,
     actualMetresByAsset,
+    disputesByAsset,
     networkIdx,
     photosByAssetItemId,
     activeRaw,
@@ -1505,6 +1741,7 @@ export async function runSyncJobData(
     fetchSorLifecycleByAsset(),
     fetchSorDesignMetresByAsset(),
     fetchSorActualMetresByAsset(),
+    fetchSorDisputesByAsset(),
     fetchNetworkAssetIndex(),
     fetchPhotosByAssetItemId(),
     fetchJobBoardItems("active"),
@@ -1516,19 +1753,19 @@ export async function runSyncJobData(
   const network = networkIdx.byName;
 
   const activePlans = activeRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset, actualMetresByAsset)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset, actualMetresByAsset, disputesByAsset)
   );
   const jobCompletePlans = jobCompleteRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset, actualMetresByAsset)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset, actualMetresByAsset, disputesByAsset)
   );
   const submittedPlans = submittedRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset, actualMetresByAsset)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset, actualMetresByAsset, disputesByAsset)
   );
   const approvedPlans = approvedRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset, actualMetresByAsset)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset, actualMetresByAsset, disputesByAsset)
   );
   const cancelledPlans = cancelledRaw.map((r) =>
-    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset, actualMetresByAsset)
+    buildPlan(r, network, sorByAsset, sorMethodsByAsset, photosByAssetItemId, lifecycleByAsset, designMetresByAsset, actualMetresByAsset, disputesByAsset)
   );
 
   // Sequential to keep monday rate-limit pressure bounded.
@@ -1539,11 +1776,11 @@ export async function runSyncJobData(
   const cancelled = await applyForBoard(cancelledPlans, dryRun);
 
   const totalWrites =
-    active.primaryWrites + active.revenueWrites + active.photoWrites + active.lifecycleWrites + active.designMetresWrites + active.actualMetresWrites +
-    jobComplete.primaryWrites + jobComplete.revenueWrites + jobComplete.photoWrites + jobComplete.lifecycleWrites + jobComplete.designMetresWrites + jobComplete.actualMetresWrites +
-    submitted.primaryWrites + submitted.revenueWrites + submitted.photoWrites + submitted.lifecycleWrites + submitted.designMetresWrites + submitted.actualMetresWrites +
-    approved.primaryWrites + approved.revenueWrites + approved.photoWrites + approved.lifecycleWrites + approved.designMetresWrites + approved.actualMetresWrites +
-    cancelled.primaryWrites + cancelled.revenueWrites + cancelled.photoWrites + cancelled.lifecycleWrites + cancelled.designMetresWrites + cancelled.actualMetresWrites;
+    active.primaryWrites + active.revenueWrites + active.photoWrites + active.lifecycleWrites + active.designMetresWrites + active.actualMetresWrites + active.disputeReasonWrites +
+    jobComplete.primaryWrites + jobComplete.revenueWrites + jobComplete.photoWrites + jobComplete.lifecycleWrites + jobComplete.designMetresWrites + jobComplete.actualMetresWrites + jobComplete.disputeReasonWrites +
+    submitted.primaryWrites + submitted.revenueWrites + submitted.photoWrites + submitted.lifecycleWrites + submitted.designMetresWrites + submitted.actualMetresWrites + submitted.disputeReasonWrites +
+    approved.primaryWrites + approved.revenueWrites + approved.photoWrites + approved.lifecycleWrites + approved.designMetresWrites + approved.actualMetresWrites + approved.disputeReasonWrites +
+    cancelled.primaryWrites + cancelled.revenueWrites + cancelled.photoWrites + cancelled.lifecycleWrites + cancelled.designMetresWrites + cancelled.actualMetresWrites + cancelled.disputeReasonWrites;
   const totalFailed =
     active.failed + jobComplete.failed + submitted.failed + approved.failed + cancelled.failed;
 
