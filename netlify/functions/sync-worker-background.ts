@@ -447,6 +447,7 @@ async function runPipeline(
       `    photo writes:        ${r.photoWrites}`,
       `    lifecycle writes:    ${r.lifecycleWrites}`,
       `    designMetres writes: ${r.designMetresWrites}`,
+      `    actualMetres writes: ${r.actualMetresWrites}`,
       `    unchanged:           ${r.unchanged}`,
       `    TEST items:          ${r.testItems}`,
       `    unmatched:           ${r.unmatchedItems}`,
