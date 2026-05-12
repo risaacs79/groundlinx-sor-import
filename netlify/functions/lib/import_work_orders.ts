@@ -66,6 +66,12 @@ const ACTIVE_COL = {
   DATE_APPROVED: "date_mm2twe5z",
   DATE_PAID: "date_mm2tz2vv",
   QUICK_NOTE: "long_text_mm2t73fd",
+  // Design Metres — May 2026 fix. Field app surfaced "missing Design
+  // Metres" warnings on most rows because CREATE never wrote this
+  // column. Only written when the asset's primary SOR line has a
+  // metres-like UOM. See isMetresUOM() below + the conditional write
+  // in the create_item payload builder.
+  DESIGN_METRES: "numeric_mm2te6g2",
 };
 
 // Approved & Paid Jobs columns (from src/lib/monday-ids.ts APPROVED_JOB_COLUMNS)
@@ -84,7 +90,24 @@ const APPROVED_COL = {
   DATE_APPROVED: "date_mm32p2b7",
   DATE_PAID: "date_mm32cjpd",
   QUICK_NOTE: "long_text_mm3277sp",
+  // Approved board's Design Metres column — different id from the
+  // active-schema cluster (board wasn't created via
+  // duplicate_board_with_structure, so its columns carry their own
+  // ids even when titles match).
+  DESIGN_METRES: "numeric_mm3233b7",
 };
+
+/** Whole-word match on "metre"/"meter" + common short forms. Mirrors
+ *  the same helper in sync_job_data.ts. Keep these in lockstep. */
+function isMetresUOM(uom: string | null | undefined): boolean {
+  if (!uom) return false;
+  const s = uom.toLowerCase().trim();
+  if (s === "m") return true;
+  if (/\b(metre|meter)s?\b/.test(s)) return true;
+  if (/^per\s+m\b/.test(s)) return true;
+  if (/^\/m\b/.test(s)) return true;
+  return false;
+}
 
 const PROJECTS_BOARD = 5028084549;
 const PROJECTS_COL = {
@@ -1105,6 +1128,19 @@ async function applyPlan(
           }
         }
         if (a.comments) colVals[COL.QUICK_NOTE] = a.comments;
+        // Design Metres — May 2026 fix. Write the primary SOR line's
+        // designQty ONLY when that line's UOM is metres-like. Non-
+        // metres jobs (pit installs / lid replacements / link-ups)
+        // leave Design Metres null, which is the correct semantic —
+        // those jobs aren't measured in metres. Note: this only
+        // captures the FIRST SOR line's value, matching the existing
+        // primaryDesignQty/primaryUom convention. The follow-up
+        // sync_job_data run does a proper sum-across-metres-lines
+        // that supersedes this single-line value if multiple metres
+        // SORs exist on the asset.
+        if (a.primaryDesignQty != null && isMetresUOM(a.primaryUom)) {
+          colVals[COL.DESIGN_METRES] = a.primaryDesignQty;
+        }
         // Project relation — look up Projects board item id by full project code
         if (a.projectId) {
           const projectMondayId = projectMap.get(a.projectId.trim());
