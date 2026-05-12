@@ -484,7 +484,7 @@ async function executeOneMove(move: PlannedMove): Promise<void> {
     boardId: String(BOARD_ID_OF[move.toBoard]),
     groupId: "topics",
   };
-  const query = `mutation ($itemId: ID!, $boardId: ID!, $groupId: String!) {
+  const query = `mutation ($itemId: ID!, $boardId: ID!, $groupId: ID!) {
     move_item_to_board(item_id: $itemId, board_id: $boardId, group_id: $groupId) { id }
   }`;
   await mondayWithRetry<{ move_item_to_board: { id: string } }>(
