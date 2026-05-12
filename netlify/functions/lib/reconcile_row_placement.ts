@@ -142,8 +142,19 @@ const STATUS_TO_BOARD_KEY = new Map<string, BoardKey>([
   // Active-lifecycle statuses → Active
   ["Pending Construction", "active"],
   ["Not Started", "active"],
-  // Disputed → Active (gets reworked, stays in lifecycle view)
-  ["Disputed", "active"],
+  // Disputed → Submitted (Item 15 PR-C, May 2026). Conceptual fix:
+  // disputed rows aren't being actively worked on by the field crew
+  // — they're awaiting UGL response. Submitted Jobs is their right
+  // home alongside other "submitted to UGL, awaiting resolution"
+  // rows (In Review, Pending Artefacts). Submitted already has the
+  // 🚨 Dispute Reason column (long_text_mm39ps0q) populated by PR
+  // #25, plus the sticky dispute tracking columns (Ever Disputed?,
+  // Last Disputed Date, Dispute Count, Ever Rejected?) and a built-
+  // in "Disputed" filtered view (53351390). The field-app dispute
+  // surfacing is board-agnostic — /api/monday/disputed-jobs scans
+  // all 4 active-cluster boards, and the asset page banner reads
+  // from disputeReason text on whichever board the row lives.
+  ["Disputed", "submitted"],
   // Descoped → Cancelled (Track G3-fix5). UGL "Descoped" maps to our
   // internal "Cancelled" status; sync_job_data also transforms the
   // status text on write. Both labels route to the same board so a
