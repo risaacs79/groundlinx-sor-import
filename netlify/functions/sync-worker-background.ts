@@ -448,6 +448,8 @@ async function runPipeline(
       `    lifecycle writes:    ${r.lifecycleWrites}`,
       `    designMetres writes: ${r.designMetresWrites}`,
       `    actualMetres writes: ${r.actualMetresWrites}`,
+      `    disputeReason writes: ${r.disputeReasonWrites}`,
+      `    disputed:            ${r.disputedCount}`,
       `    unchanged:           ${r.unchanged}`,
       `    TEST items:          ${r.testItems}`,
       `    unmatched:           ${r.unmatchedItems}`,
