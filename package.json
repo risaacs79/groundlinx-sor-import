@@ -11,7 +11,8 @@
     "archive-dupes": "tsx scripts/archive_dupes.ts",
     "migrate-row-placement": "tsx scripts/migrate_row_placement.ts",
     "bulk-update-internal-statuses": "tsx scripts/bulk_update_internal_statuses.ts",
-    "dry-run-design-propagation": "tsx scripts/dry_run_design_propagation.ts"
+    "dry-run-design-propagation": "tsx scripts/dry_run_design_propagation.ts",
+    "live-design-propagation": "tsx scripts/run_design_propagation.ts"
   },
   "dependencies": {
     "@netlify/functions": "^2.8.0",
