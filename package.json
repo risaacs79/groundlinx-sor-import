@@ -14,7 +14,9 @@
     "dry-run-design-propagation": "tsx scripts/dry_run_design_propagation.ts",
     "live-design-propagation": "tsx scripts/run_design_propagation.ts",
     "dry-run-actual-metres-propagation": "tsx scripts/dry_run_actual_metres_propagation.ts",
-    "live-actual-metres-propagation": "tsx scripts/run_actual_metres_propagation.ts"
+    "live-actual-metres-propagation": "tsx scripts/run_actual_metres_propagation.ts",
+    "backfill-defect-asset-data": "tsx scripts/backfill_defect_asset_data.ts",
+    "backfill-network-asset-addresses": "tsx scripts/backfill_network_asset_addresses.ts"
   },
   "dependencies": {
     "@netlify/functions": "^2.8.0",
