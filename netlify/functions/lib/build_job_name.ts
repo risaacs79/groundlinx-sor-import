@@ -2,11 +2,11 @@
  * Build the canonical monday item-name for an Active Jobs / Approved & Paid
  * Jobs row.
  *
- * Three cases (Priority 5 Option Z, May 2026 — SOR-first, Asset ID last):
+ * Three cases (Track F1 May 2026 — duct flip on the qty>1 single-SOR case):
  *
  *   1. Single SOR, Design Qty > 1
- *        {qty}{UOM_short} - {SOR Friendly Name} - {Asset ID}
- *      e.g. "28m - DUCT - 50mm - Cat 1 - OTR - 2URL-20-06-DCT-782"
+ *        {qty}{UOM_short} - {Asset ID} - {SOR Friendly Name}
+ *      e.g. "28m - 2URL-20-06-DCT-782 - DUCT - 50mm - Cat 1 - OTR"
  *
  *   2. Single SOR, Design Qty <= 1 (qty prefix dropped — "1 pit" adds no info)
  *        {SOR Friendly Name} - {Asset ID}
@@ -52,8 +52,9 @@ export function buildJobName(input: JobNameInput): string {
   const sorName = sorNames[0];
   const qty = input.designQty ?? null;
   if (qty != null && qty > 1) {
+    // Duct flip (Track F1): qty - asset - sor (asset in middle).
     const uomShort = shortUom(input.uom);
-    return `${qty}${uomShort} - ${sorName} - ${asset}`;
+    return `${qty}${uomShort} - ${asset} - ${sorName}`;
   }
   return `${sorName} - ${asset}`;
 }

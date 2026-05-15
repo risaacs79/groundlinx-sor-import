@@ -64,6 +64,38 @@ const UGL_STATUS_INDEX: Record<string, number> = {
 
 const BATCH_SIZE = 25; // GraphQL alias batches per request
 
+/**
+ * Track F2 (May 2026): when UGL's daily extract leaves Design Qty
+ * blank for a per-unit SOR (Install P5 Pit, ACM Removal, Composite
+ * Lid, Manhole Lid, Core Bore — anything where one-per-asset is the
+ * only meaningful value), default to 1. Per-metre SORs (duct install
+ * CW-01-*, duct repair CW-05-*, Pipe Proving CI-*) leave null and
+ * log a warning so operators can fill in from UGL source data.
+ *
+ * Categorisation by SOR code prefix mirrors scripts/import_work_orders.ts
+ * categorizeSor() — single source of truth lives there; this is a
+ * sync-time guard that doesn't require a Rate Card fetch.
+ */
+function defaultDesignQty(
+  rawQty: number | null,
+  sorCode: string,
+  ctx: { assetId: string }
+): number | null {
+  if (rawQty != null) return rawQty;
+  const code = sorCode.trim().toUpperCase();
+  // Per-unit SORs — default 1
+  if (code === "CW-02-01-08" || code === "CW-02-01-06") return 1; // lids
+  if (code.startsWith("CW-02-05-")) return 1; // manhole lids + accessories
+  if (code.startsWith("CW-02-03-") || code.startsWith("CW-02-04-")) return 1; // ACM removal
+  if (code.startsWith("CW-02-")) return 1; // pit install (CW-02-01-*, CW-02-02-*)
+  if (code.startsWith("CW-03-")) return 1; // Core Bore
+  // Per-metre / unrecognised — leave blank, log warning
+  console.warn(
+    `[sync-sor-extract] WARNING: Design Qty blank for non-unit SOR — assetId=${ctx.assetId} sor=${sorCode} (left null; needs manual fill from UGL source)`
+  );
+  return null;
+}
+
 // ---------- Types ----------
 interface ExtractRow {
   rowIndex: number; // 2..N (1-indexed sheet row, header on 1)
@@ -452,7 +484,11 @@ function diffRow(extract: ExtractRow, current: MondayRow): RowDiff {
   setIfChangedText(COLUMN.PROJECT_ID, "Project ID", extract.projectId);
   setIfChangedText(COLUMN.ADA, "ADA", extract.ada);
   setIfChangedText(COLUMN.DESCRIPTION, "SOR Description", extract.sorDescription);
-  setIfChangedNumber(COLUMN.DESIGN_QTY, "Design Qty", extract.designQty);
+  setIfChangedNumber(
+    COLUMN.DESIGN_QTY,
+    "Design Qty",
+    defaultDesignQty(extract.designQty, extract.sor, { assetId: extract.assetId })
+  );
   setIfChangedNumber(COLUMN.ACTUAL_QTY, "Actual Qty", extract.actualQty);
   setIfChangedNumber(COLUMN.ACCEPTED_QTY, "Accepted Qty", extract.acceptedQty);
   setIfChangedStatus(
