@@ -20,6 +20,13 @@ import ExcelJS from "exceljs";
 
 // ---------- Config (mirrors src/lib/monday-ids.ts SOR_COLUMNS) ----------
 const SOR_BOARD_ID = 5028087610;
+// RCTI Payment Cycles board (5028104633) — Sarah's twice-monthly UGL N2P
+// Atlas payment cycle index. Each row carries Cut-off Date, RCTI Date,
+// Payment Date, and a manually-managed Status (Open → Cut-off Passed →
+// RCTI Issued → Paid). The cycle link drives the cashflow page's actual
+// cash-received calc, distinct from UGL Status = "Paid" which only means
+// UGL has approved + invoiced (money lands ~14 days later on a Thursday).
+const RCTI_CYCLES_BOARD_ID = 5028104633;
 
 const COLUMN = {
   ASSET_TEXT: "text_mm2tawd5",
@@ -32,11 +39,52 @@ const COLUMN = {
   ACCEPTED_QTY: "numeric_mm2tc70m",
   CONS_STATUS: "color_mm30cvg5",
   UGL_STATUS: "color_mm2tavfn",
+  PAYMENT_STATUS: "color_mm2tktkr",
   INVOICE_ID: "text_mm2t3sb5",
   CONSTRUCTION_DATE: "date_mm30mc4k",
   REVIEW_DATE: "date_mm30n113",
   VA_COMMENTS: "long_text_mm304kjb",
+  /** 🗓️ RCTI Payment Cycle — board_relation → RCTI Payment Cycles
+   *  (5028104633). Added in the May 2026 RCTI integration migration via
+   *  scripts/migrate_rcti_cycle_column.ts. Single link per row. */
+  RCTI_CYCLE: "board_relation_mm3drkgn",
 } as const;
+
+const CYCLE_COLUMN = {
+  RCTI_DATE: "date_mm2vmfgq",
+  PAYMENT_DATE: "date_mm2vageh",
+  STATUS: "color_mm2v5a45",
+} as const;
+
+/** Cycle statuses the policy table cares about. Sarah manages these
+ *  manually on monday — read-only from the sync's side. */
+type CycleStatus =
+  | "Open"
+  | "Cut-off Passed"
+  | "RCTI Issued"
+  | "Paid"
+  | "Late/Disputed"
+  | string; // defensive: unknown labels treated as Open-equivalent
+
+/** Payment Status labels the sync OWNS. We never clobber Held/Submitted
+ *  /Disputed values that Sarah has set manually — those are her overrides.
+ *  Disputed CAN be written by the sync when transitioning from a state
+ *  we own; the protection is on reading the CURRENT value. */
+const PAYMENT_STATUS_OWNED = new Set<string | null>([
+  null,
+  "Pending",
+  "Pending Receipt",
+  "Paid",
+]);
+
+const PAYMENT_STATUS_INDEX: Record<string, number> = {
+  Pending: 9, // existing
+  "Pending Receipt": 1, // added by migration May 2026
+  Paid: 6, // existing
+  Disputed: 11, // existing
+  Held: 0, // existing — Sarah's manual state, sync never writes
+  Submitted: 158, // existing — historical, sync never writes
+};
 
 const CONS_STATUS_INDEX: Record<string, number> = {
   Pending: 0,
@@ -113,6 +161,12 @@ interface ExtractRow {
   constructionDate: string | null; // ISO YYYY-MM-DD
   reviewDate: string | null; // ISO YYYY-MM-DD
   comments: string | null;
+  /** RCTI Date as supplied by UGL on the extract row. OPTIONAL — UGL
+   *  hasn't shipped this column at time of writing (May 2026); when
+   *  present it's the primary signal for resolving the SOR Line's
+   *  RCTI Payment Cycle. Falls back to Invoice-ID-grouping propagation.
+   *  ISO YYYY-MM-DD, null when the column is absent or the cell is blank. */
+  rctiDate: string | null;
 }
 
 interface MondayRow {
@@ -124,6 +178,20 @@ interface MondayRow {
 interface MondayCellValue {
   text: string | null;
   value: string | null;
+  /** Populated only for board_relation columns (RCTI_CYCLE). Array of
+   *  linked item ids. monday returns it via the BoardRelationValue
+   *  inline fragment on column_values. */
+  linked_item_ids?: string[];
+}
+
+/** Parsed shape of an RCTI Payment Cycle row — what diffRow needs to
+ *  apply the Payment Status policy table. */
+interface CycleInfo {
+  itemId: string;
+  name: string;
+  rctiDateIso: string | null;
+  paymentDateIso: string | null;
+  status: CycleStatus;
 }
 
 type ChangeMap = Record<string, unknown>;
@@ -293,6 +361,24 @@ async function readExtract(source: string | Buffer): Promise<ExtractReadResult> 
       throw new Error(`Missing column "${name}" in Cons_Data header`);
     }
   }
+  // OPTIONAL: RCTI Date column. UGL may or may not ship this; if absent
+  // the sync falls back to Invoice-ID propagation for cycle resolution.
+  // Probe a handful of plausible header spellings.
+  const rctiDateColIdx =
+    header["RCTI Date"] ??
+    header["rcti_date"] ??
+    header["RCTI_Date"] ??
+    header["rctiDate"] ??
+    null;
+  if (rctiDateColIdx == null) {
+    console.log(
+      `[sync_sor_extract] readExtract: no RCTI Date column found in header — cycle resolution will fall back to Invoice-ID-grouping propagation.`
+    );
+  } else {
+    console.log(
+      `[sync_sor_extract] readExtract: RCTI Date column found at index ${rctiDateColIdx} — primary cycle matcher will use it.`
+    );
+  }
 
   const rows: ExtractRow[] = [];
   const rowErrors: ExtractReadResult["rowErrors"] = [];
@@ -321,6 +407,10 @@ async function readExtract(source: string | Buffer): Promise<ExtractReadResult> 
         constructionDate: cellDateIso(get("construction_date")),
         reviewDate: cellDateIso(get("review_date")),
         comments: cellText(get("comments")),
+        rctiDate:
+          rctiDateColIdx != null
+            ? cellDateIso(row.getCell(rctiDateColIdx).value)
+            : null,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -359,14 +449,26 @@ async function fetchAllSorLines(): Promise<MondayRow[]> {
         ? `query ($cursor: String!, $colIds: [String!]) {
             next_items_page(limit: 500, cursor: $cursor) {
               cursor
-              items { id name column_values(ids: $colIds) { id text value } }
+              items {
+                id name
+                column_values(ids: $colIds) {
+                  id text value
+                  ... on BoardRelationValue { linked_item_ids }
+                }
+              }
             }
           }`
         : `query ($boardId: ID!, $colIds: [String!]) {
             boards(ids: [$boardId]) {
               items_page(limit: 500) {
                 cursor
-                items { id name column_values(ids: $colIds) { id text value } }
+                items {
+                  id name
+                  column_values(ids: $colIds) {
+                    id text value
+                    ... on BoardRelationValue { linked_item_ids }
+                  }
+                }
               }
             }
           }`,
@@ -381,7 +483,11 @@ async function fetchAllSorLines(): Promise<MondayRow[]> {
     for (const item of page.items) {
       const values: Record<string, MondayCellValue> = {};
       for (const cv of item.column_values) {
-        values[cv.id] = { text: cv.text, value: cv.value };
+        values[cv.id] = {
+          text: cv.text,
+          value: cv.value,
+          linked_item_ids: cv.linked_item_ids,
+        };
       }
       all.push({ id: item.id, name: item.name, values });
     }
@@ -394,7 +500,173 @@ async function fetchAllSorLines(): Promise<MondayRow[]> {
 interface RawItem {
   id: string;
   name: string;
-  column_values: Array<{ id: string; text: string | null; value: string | null }>;
+  column_values: Array<{
+    id: string;
+    text: string | null;
+    value: string | null;
+    linked_item_ids?: string[];
+  }>;
+}
+
+// ---------- RCTI Payment Cycles fetch ----------
+async function fetchAllCycles(): Promise<CycleInfo[]> {
+  const data = await monday<{
+    boards: Array<{
+      items_page: {
+        cursor: string | null;
+        items: Array<{
+          id: string;
+          name: string;
+          column_values: Array<{ id: string; text: string | null }>;
+        }>;
+      };
+    }>;
+  }>(
+    `query ($boardId: ID!, $colIds: [String!]) {
+      boards(ids: [$boardId]) {
+        items_page(limit: 100) {
+          cursor
+          items {
+            id name
+            column_values(ids: $colIds) { id text }
+          }
+        }
+      }
+    }`,
+    {
+      boardId: String(RCTI_CYCLES_BOARD_ID),
+      colIds: Object.values(CYCLE_COLUMN),
+    }
+  );
+  const items = data.boards[0]?.items_page?.items ?? [];
+  return items.map((it) => {
+    const cv: Record<string, string | null> = {};
+    for (const c of it.column_values) cv[c.id] = c.text;
+    return {
+      itemId: it.id,
+      name: it.name,
+      rctiDateIso: cv[CYCLE_COLUMN.RCTI_DATE]?.trim() || null,
+      paymentDateIso: cv[CYCLE_COLUMN.PAYMENT_DATE]?.trim() || null,
+      status: (cv[CYCLE_COLUMN.STATUS]?.trim() || "Open") as CycleStatus,
+    };
+  });
+}
+
+// ---------- Cycle resolution helpers ----------
+
+/** Build a lookup from ISO RCTI date → cycle id. Used by the primary
+ *  matcher when UGL's extract carries an "RCTI Date" column. */
+function indexCyclesByRctiDate(cycles: CycleInfo[]): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const c of cycles) {
+    if (c.rctiDateIso) m.set(c.rctiDateIso, c.itemId);
+  }
+  return m;
+}
+
+/** Build a lookup from cycle id → CycleInfo for fast policy resolution. */
+function indexCyclesById(cycles: CycleInfo[]): Map<string, CycleInfo> {
+  const m = new Map<string, CycleInfo>();
+  for (const c of cycles) m.set(c.itemId, c);
+  return m;
+}
+
+/** Walk the SOR Lines we just fetched and build a propagation map:
+ *  Invoice ID → existing linked cycle id. Used as the secondary matcher
+ *  when UGL's extract doesn't include an RCTI Date — any SOR Line
+ *  already manually linked to a cycle seeds the link for its siblings
+ *  with the same Invoice ID. First-link-wins on ties (rare; would mean
+ *  Sarah mis-tagged) with a logged warning. */
+function indexInvoiceToCycle(rows: MondayRow[]): Map<string, string> {
+  const m = new Map<string, string>();
+  const seenCollision = new Set<string>();
+  for (const r of rows) {
+    const invoice = r.values[COLUMN.INVOICE_ID]?.text?.trim();
+    if (!invoice) continue;
+    const linked = r.values[COLUMN.RCTI_CYCLE]?.linked_item_ids ?? [];
+    const cycleId = linked[0];
+    if (!cycleId) continue;
+    const prior = m.get(invoice);
+    if (prior && prior !== cycleId && !seenCollision.has(invoice)) {
+      console.warn(
+        `[sync_sor_extract] invoice ${invoice} has conflicting cycle links: ${prior} vs ${cycleId} — using ${prior} (first-link-wins). Investigate.`
+      );
+      seenCollision.add(invoice);
+      continue;
+    }
+    if (!prior) m.set(invoice, cycleId);
+  }
+  return m;
+}
+
+/** Resolve the cycle id for an SOR Line given the available signals.
+ *  Returns null when neither primary nor fallback match resolves. */
+function resolveCycleId(
+  extract: ExtractRow,
+  cycleByRctiDate: Map<string, string>,
+  invoiceToCycle: Map<string, string>
+): string | null {
+  // Primary: extract carries explicit RCTI Date → cycle by date_mm2vmfgq
+  if (extract.rctiDate) {
+    const byDate = cycleByRctiDate.get(extract.rctiDate);
+    if (byDate) return byDate;
+  }
+  // Fallback: by Invoice ID propagation from already-linked siblings
+  const invoice = extract.invoiceNo?.trim();
+  if (invoice) {
+    const byInvoice = invoiceToCycle.get(invoice);
+    if (byInvoice) return byInvoice;
+  }
+  return null;
+}
+
+// ---------- Payment Status policy table ----------
+
+/** Apply the May 2026 Payment Status policy. Returns the target label
+ *  (or null when the row should be cleared / left alone). Caller is
+ *  responsible for the "don't clobber Held / Disputed / Submitted"
+ *  guard — this function only computes the target.
+ *
+ *  Policy (per the brief):
+ *    UGL Status              Cycle Status            Target
+ *    -------------------------------------------------------------
+ *    Approved                (any)                   Pending
+ *    Paid - Pending RCTI     (any)                   Pending
+ *    Paid / Partial Paid     Open / Cut-off Passed   Pending
+ *    Paid / Partial Paid     RCTI Issued             Pending Receipt
+ *    Paid / Partial Paid     Paid                    Paid
+ *    Disputed                (any)                   Disputed
+ *    Cancelled               (any)                   (clear, returns "" sentinel)
+ *    other                                           null (no opinion) */
+function computePaymentStatusTarget(
+  uglStatus: string | null,
+  cycle: CycleInfo | null
+): string | "" | null {
+  if (!uglStatus) return null;
+  switch (uglStatus) {
+    case "Approved":
+    case "Paid - Pending RCTI":
+      return "Pending";
+    case "Paid":
+    case "Partial Paid": {
+      const cs = cycle?.status ?? null;
+      if (cs === "Paid") return "Paid";
+      if (cs === "RCTI Issued") return "Pending Receipt";
+      // Open, Cut-off Passed, Late/Disputed, unknown → Pending (the
+      // safest "not yet in our bank" bucket).
+      return "Pending";
+    }
+    case "Disputed":
+      return "Disputed";
+    case "Cancelled":
+      return ""; // clear sentinel
+    default:
+      // Not Started / In Progress / Field Complete / Submitted / In
+      // Review / Pending Artefacts / Pending Construction / Descoped /
+      // Overpaid / Rejected — sync has no opinion, leave Payment Status
+      // alone.
+      return null;
+  }
 }
 
 // ---------- Index by (asset id, item code) ----------
@@ -420,9 +692,21 @@ interface RowDiff {
   itemId: string;
   changes: ChangeMap;
   changedFields: string[];
+  /** True when this row's diff includes a 🗓️ RCTI Payment Cycle write.
+   *  Counted separately in SyncResult.rctiCycleLinkWrites. */
+  rctiCycleLinkWritten: boolean;
+  /** True when this row's diff includes a Payment Status write. Counted
+   *  separately in SyncResult.paymentStatusMirrorWrites. */
+  paymentStatusMirrorWritten: boolean;
 }
 
-function diffRow(extract: ExtractRow, current: MondayRow): RowDiff {
+function diffRow(
+  extract: ExtractRow,
+  current: MondayRow,
+  cycleByRctiDate: Map<string, string>,
+  invoiceToCycle: Map<string, string>,
+  cyclesById: Map<string, CycleInfo>
+): RowDiff {
   const changes: ChangeMap = {};
   const changedFields: string[] = [];
   const cur = current.values;
@@ -512,7 +796,79 @@ function diffRow(extract: ExtractRow, current: MondayRow): RowDiff {
   setIfChangedDate(COLUMN.REVIEW_DATE, "Review Date", extract.reviewDate);
   setIfChangedText(COLUMN.VA_COMMENTS, "VA Comments", extract.comments);
 
-  return { itemId: current.id, changes, changedFields };
+  // ----- RCTI Payment Cycle link (May 2026) -----
+  // Resolve the target cycle from extract signals (RCTI Date primary,
+  // Invoice-ID-grouping fallback). Write only when it actually differs
+  // from the current linked id — idempotent on re-runs.
+  const targetCycleId = resolveCycleId(extract, cycleByRctiDate, invoiceToCycle);
+  const currentLinkedIds = cur[COLUMN.RCTI_CYCLE]?.linked_item_ids ?? [];
+  const currentCycleId = currentLinkedIds[0] ?? null;
+  let rctiCycleLinkWritten = false;
+  if (targetCycleId && targetCycleId !== currentCycleId) {
+    // board_relation write shape: { item_ids: [<itemId>] }
+    changes[COLUMN.RCTI_CYCLE] = { item_ids: [Number(targetCycleId)] };
+    changedFields.push("RCTI Payment Cycle");
+    rctiCycleLinkWritten = true;
+  }
+  // Effective cycle after this run's diff lands.
+  const effectiveCycleId = targetCycleId ?? currentCycleId;
+  const effectiveCycle = effectiveCycleId
+    ? cyclesById.get(effectiveCycleId) ?? null
+    : null;
+
+  // ----- Payment Status mirror (May 2026) -----
+  // Three-gate guard (mirrors sync_job_data.ts's Job Status mirror in
+  // PR #26):
+  //   1. Only fire when something material changed this run — either
+  //      the row's UGL Status updated OR the cycle link is being set/
+  //      changed. Avoids churn on no-op syncs.
+  //   2. Don't clobber Held / Submitted / Disputed — Sarah's manual
+  //      overrides. Only write when current Payment Status is in the
+  //      sync-owned set { null, Pending, Pending Receipt, Paid }.
+  //   3. Only emit the change when target differs from current.
+  const uglStatusChanged = changedFields.includes("SOR Status");
+  const cycleLinkChanged = rctiCycleLinkWritten;
+  const currentPaymentStatus = cur[COLUMN.PAYMENT_STATUS]?.text ?? null;
+  let paymentStatusMirrorWritten = false;
+  if (
+    (uglStatusChanged || cycleLinkChanged) &&
+    PAYMENT_STATUS_OWNED.has(currentPaymentStatus)
+  ) {
+    // Use the EFFECTIVE UGL Status after this run's diff lands — same
+    // pattern as Actual Metres scope filter in sync_job_data.ts.
+    const effectiveUglStatus = uglStatusChanged
+      ? extract.sorStatus
+      : cur[COLUMN.UGL_STATUS]?.text ?? null;
+    const target = computePaymentStatusTarget(effectiveUglStatus, effectiveCycle);
+    if (target === "") {
+      // Clear sentinel — Cancelled UGL Status. monday accepts the empty
+      // string to clear a status column.
+      if (currentPaymentStatus != null) {
+        changes[COLUMN.PAYMENT_STATUS] = { label: "" };
+        changedFields.push("Payment Status");
+        paymentStatusMirrorWritten = true;
+      }
+    } else if (target != null && target !== currentPaymentStatus) {
+      const labelId = PAYMENT_STATUS_INDEX[target];
+      if (labelId == null) {
+        console.warn(
+          `[sync_sor_extract] unknown Payment Status target "${target}" — skip (not in label map)`
+        );
+      } else {
+        changes[COLUMN.PAYMENT_STATUS] = { index: labelId };
+        changedFields.push("Payment Status");
+        paymentStatusMirrorWritten = true;
+      }
+    }
+  }
+
+  return {
+    itemId: current.id,
+    changes,
+    changedFields,
+    rctiCycleLinkWritten,
+    paymentStatusMirrorWritten,
+  };
 }
 
 // ---------- Apply mutations in batches via GraphQL aliases ----------
@@ -600,6 +956,18 @@ export interface SyncResult {
   newFieldComplete: string[];
   /** "<assetId> / <sor>" keys whose SOR Status flipped to "Paid" on this run */
   newPaid: string[];
+  /** Count of SOR Lines whose 🗓️ RCTI Payment Cycle link was set/changed
+   *  on this run (May 2026). Surfaced in the Sync Run audit log. */
+  rctiCycleLinkWrites: number;
+  /** Count of SOR Lines whose Payment Status was updated by the
+   *  Pending → Pending Receipt → Paid mirror on this run. */
+  paymentStatusMirrorWrites: number;
+  /** Count of SOR Lines for which cycle resolution failed despite an
+   *  Invoice ID being present — meaning there's no extract RCTI Date
+   *  AND no sibling SOR Line is linked yet. These are bootstrap-blocked;
+   *  Sarah needs to seed at least one link per Invoice ID, or UGL needs
+   *  to add the RCTI Date column. Logged for visibility. */
+  rctiCycleResolutionMisses: number;
   elapsedMs: number;
 }
 
@@ -624,9 +992,25 @@ export async function runSyncSor(buffer: Buffer): Promise<SyncResult> {
   );
   const index = indexMondayRows(monday_rows);
 
+  // ---- May 2026 RCTI Payment Cycles integration ----
+  // Parallel fetch of the (small, ~18-row) cycles board + build the two
+  // lookup maps used by resolveCycleId + the Payment Status policy.
+  console.log(`[sync_sor_extract] runSyncSor fetching RCTI Payment Cycles…`);
+  const cycles = await fetchAllCycles();
+  console.log(
+    `[sync_sor_extract] runSyncSor cycles fetched: ${cycles.length} rows`
+  );
+  const cycleByRctiDate = indexCyclesByRctiDate(cycles);
+  const cyclesById = indexCyclesById(cycles);
+  const invoiceToCycle = indexInvoiceToCycle(monday_rows);
+  console.log(
+    `[sync_sor_extract] runSyncSor cycle indices ready — byRctiDate=${cycleByRctiDate.size} byInvoiceId=${invoiceToCycle.size}`
+  );
+
   const diffs: RowDiff[] = [];
   let unmatched = 0;
   let unchanged = 0;
+  let rctiCycleResolutionMisses = 0;
   const newFieldComplete: string[] = [];
   const newPaid: string[] = [];
 
@@ -636,7 +1020,19 @@ export async function runSyncSor(buffer: Buffer): Promise<SyncResult> {
       unmatched++;
       continue;
     }
-    const diff = diffRow(ex, current);
+    const diff = diffRow(ex, current, cycleByRctiDate, invoiceToCycle, cyclesById);
+
+    // Resolution miss tracking — Invoice ID set but neither matcher
+    // resolved AND we didn't already have a cycle linked. Surfaced as
+    // a Sync Run counter so Sarah / operators can spot bootstrap gaps.
+    if (
+      ex.invoiceNo &&
+      !diff.rctiCycleLinkWritten &&
+      !(current.values[COLUMN.RCTI_CYCLE]?.linked_item_ids ?? []).length
+    ) {
+      rctiCycleResolutionMisses++;
+    }
+
     if (diff.changedFields.length === 0) {
       unchanged++;
       continue;
@@ -658,6 +1054,10 @@ export async function runSyncSor(buffer: Buffer): Promise<SyncResult> {
       newPaid.push(`${ex.assetId} / ${ex.sor}`);
     }
   }
+  const rctiCycleLinkWrites = diffs.filter((d) => d.rctiCycleLinkWritten).length;
+  const paymentStatusMirrorWrites = diffs.filter(
+    (d) => d.paymentStatusMirrorWritten
+  ).length;
 
   console.log(
     `[sync_sor_extract] runSyncSor diffs=${diffs.length} unmatched=${unmatched} unchanged=${unchanged} newFieldComplete=${newFieldComplete.length} newPaid=${newPaid.length}`
@@ -673,7 +1073,7 @@ export async function runSyncSor(buffer: Buffer): Promise<SyncResult> {
   ];
 
   console.log(
-    `[sync_sor_extract] runSyncSor done in ${Date.now() - start}ms updated=${result.updated} failed=${result.failed + rowErrors.length}`
+    `[sync_sor_extract] runSyncSor done in ${Date.now() - start}ms updated=${result.updated} failed=${result.failed + rowErrors.length} rctiCycleLinkWrites=${rctiCycleLinkWrites} paymentStatusMirrorWrites=${paymentStatusMirrorWrites} rctiCycleResolutionMisses=${rctiCycleResolutionMisses}`
   );
 
   return {
@@ -686,6 +1086,9 @@ export async function runSyncSor(buffer: Buffer): Promise<SyncResult> {
     failures: allFailures,
     newFieldComplete,
     newPaid,
+    rctiCycleLinkWrites,
+    paymentStatusMirrorWrites,
+    rctiCycleResolutionMisses,
     elapsedMs: Date.now() - start,
   };
 }

@@ -16,7 +16,8 @@
     "dry-run-actual-metres-propagation": "tsx scripts/dry_run_actual_metres_propagation.ts",
     "live-actual-metres-propagation": "tsx scripts/run_actual_metres_propagation.ts",
     "backfill-defect-asset-data": "tsx scripts/backfill_defect_asset_data.ts",
-    "backfill-network-asset-addresses": "tsx scripts/backfill_network_asset_addresses.ts"
+    "backfill-network-asset-addresses": "tsx scripts/backfill_network_asset_addresses.ts",
+    "migrate-rcti-cycle-column": "tsx scripts/migrate_rcti_cycle_column.ts"
   },
   "dependencies": {
     "@netlify/functions": "^2.8.0",
