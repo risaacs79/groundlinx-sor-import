@@ -478,6 +478,9 @@ async function runPipeline(
       `  failed: ${syncSummary.failed}`,
       `  new Field Complete: ${syncSummary.newFieldComplete.length}`,
       `  new Paid: ${syncSummary.newPaid.length}`,
+      `  rctiCycleLink writes:         ${syncSummary.rctiCycleLinkWrites}`,
+      `  paymentStatusMirror writes:   ${syncSummary.paymentStatusMirrorWrites}`,
+      `  rctiCycleResolution misses:   ${syncSummary.rctiCycleResolutionMisses}`,
       ...(syncSummary.failures.length > 0
         ? [
             "  failures:",
